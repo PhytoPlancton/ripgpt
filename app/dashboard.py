@@ -272,11 +272,11 @@ tick();
   const wire=new THREE.Mesh(new THREE.IcosahedronGeometry(0.85,1),
     new THREE.MeshBasicMaterial({color:0x1d2940,wireframe:true,transparent:true,opacity:0.6}));
   group.add(wire);
-  // cursor tracking — the sphere leans toward the pointer (+ subtle camera parallax)
+  // cursor tracking — anywhere on the page (normalised to the whole window), so the
+  // sphere leans toward the pointer wherever it is, not only over the hero box.
   let mx=0,my=0,tmx=0,tmy=0;
-  host.addEventListener('pointermove',e=>{ const r=host.getBoundingClientRect();
-    tmx=((e.clientX-r.left)/r.width)*2-1; tmy=((e.clientY-r.top)/r.height)*2-1; });
-  host.addEventListener('pointerleave',()=>{ tmx=0; tmy=0; });
+  window.addEventListener('pointermove',e=>{
+    tmx=(e.clientX/window.innerWidth)*2-1; tmy=(e.clientY/window.innerHeight)*2-1; });
   function lerp(a,b,t){return a+(b-a)*t;}
   function col(h){ // green -> amber -> red
     const g1=[0x39,0xd9,0x8a], a1=[0xff,0xb4,0x54], r1=[0xff,0x5c,0x7c];
