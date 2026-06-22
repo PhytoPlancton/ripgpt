@@ -23,3 +23,4 @@ Format : `[date] | ce qui a mal tourné | règle pour l'éviter`
 ## Déploiement (EDJ Labs / Cloudflare)
 - `[2026-06-22] | — | ripgpt pilote un navigateur contre Cloudflare : déployé sur IP datacenter (EDJ Labs), Cloudflare bloque probablement + risque de flag du compte ChatGPT. Préférer : navigateur sur le Mac + tunnel Cloudflare. Sinon tester EDJ Labs avant de s'engager.`
 - `[2026-06-22] | — | Traefik EDJ Labs : utiliser "Deploy Labels" (pas "Labels"), port loadbalancer = 8850 pour ripgpt, DNS Cloudflare en gris (DNS only) au début.`
+- `[2026-06-22] | Build GHCR échoué en ~15s : nom d'image avec majuscule (ghcr.io/PhytoPlancton/...) refusé | GHCR exige des minuscules → IMAGE="ghcr.io/$(echo '\${{ github.repository }}' | tr '[:upper:]' '[:lower:]')". Aussi bumper actions/checkout@v4 + docker/login-action@v3 (Node20 déprécié).`
