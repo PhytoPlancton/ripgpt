@@ -5,8 +5,6 @@ services:
       - "8850:8850"
     environment:
       - API_PORT=8850
-      - DEFAULT_MODEL=chatgpt-temporary
-      - PERSISTENT_MODEL=chatgpt
       - VERBOSE=true
       - HEADLESS=true
       - SESSION_CHECK_INTERVAL=900
@@ -42,6 +40,7 @@ services:
       - ENABLE_TAGS_GENERATION=false
       - ENABLE_AUTOCOMPLETE_GENERATION=false
       - ENABLE_RETRIEVAL_QUERY_GENERATION=false
+      - ENABLE_EVALUATION_ARENA_MODELS=false     # hide the 'Arena Model' entry
     volumes:
       - open-webui:/app/backend/data
     depends_on:

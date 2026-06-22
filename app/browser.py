@@ -172,6 +172,19 @@ INTERCEPT_JS = """
                       || url.includes('/backend-anon/conversation'))
                       && !url.includes('/prepare')
                       && method === 'POST';
+        // Best-effort model override: rewrite the outgoing "model" field on both the
+        // turn and the prepare calls. Far more robust than driving ChatGPT's model menu.
+        const isConvoPost = (url.includes('/backend-api/f/conversation')
+                          || url.includes('/backend-anon/f/conversation')) && method === 'POST';
+        if (isConvoPost && window.__ripgpt_model && init && typeof init.body === 'string') {
+            try {
+                const b = JSON.parse(init.body);
+                if (b && typeof b === 'object' && typeof b.model === 'string') {
+                    b.model = window.__ripgpt_model;
+                    init = Object.assign({}, init, { body: JSON.stringify(b) });
+                }
+            } catch (e) {}
+        }
         const response = await _origFetch(input, init);
         if (!isConvo) return response;
         window.__turn_started = true;
@@ -621,6 +634,9 @@ def _wait_for_answer(page):
     chunks = page.evaluate("() => (window.__sse_chunks || []).concat(window.__ws_chunks || [])")
     raw = "".join(chunks)
     _log(f"[*] Captured {len(raw)} chars across fetch + websocket transports.")
+    _m = re.search(r'"model_slug":\s*"([^"]+)"', raw)
+    if _m:
+        _log(f"[*] model_slug actually used: {_m.group(1)}")
     answer = _parse_sse_answer(raw)
 
     # The final rendered DOM is authoritative: the v1 stream can include transient
@@ -706,11 +722,17 @@ class ChatSession:
         except Exception:
             return False
 
-    def ask(self, question):
+    def _apply_model(self, model_slug):
+        # Force the model for this turn by rewriting the outgoing request's "model"
+        # field (see INTERCEPT_JS). None/empty = no override (ChatGPT's selected model).
+        self._page.evaluate("(s) => { window.__ripgpt_model = s || null; }", model_slug or None)
+
+    def ask(self, question, model_slug=None):
         # Re-inject interceptors in case page JS replaced window.fetch / WebSocket
         self._page.evaluate(FETCH_INTERCEPT_JS)
         self._page.evaluate(RESET_SSE_JS)
         _ensure_composer(self._page)
+        self._apply_model(model_slug)
         composer = self._page.locator("#prompt-textarea")
         composer.click()
         self._page.keyboard.type(question, delay=20)
@@ -718,11 +740,12 @@ class ChatSession:
         self._page.keyboard.press("Enter")
         return _wait_for_answer(self._page)
 
-    def send(self, question):
+    def send(self, question, model_slug=None):
         """Type and send a question without waiting for the answer."""
         self._page.evaluate(FETCH_INTERCEPT_JS)
         self._page.evaluate(RESET_SSE_JS)
         _ensure_composer(self._page)
+        self._apply_model(model_slug)
         composer = self._page.locator("#prompt-textarea")
         composer.click()
         self._page.keyboard.type(question, delay=20)

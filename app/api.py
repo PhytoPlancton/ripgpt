@@ -39,18 +39,47 @@ def _require_api_key(request: Request) -> None:
     if not auth.startswith("Bearer ") or auth[len("Bearer "):] != API_KEY:
         raise HTTPException(status_code=401, detail={"message": "Invalid or missing API key.", "type": "invalid_request_error", "code": "invalid_api_key"})
 
-MODEL_NAME = os.environ.get("DEFAULT_MODEL", "chatgpt-temporary")
-MODEL_NAME_PERSISTENT = os.environ.get("PERSISTENT_MODEL", "chatgpt")
 SERVICE = BrowserSessionService()
+
+# Models exposed to clients. Each maps to a ChatGPT model slug (forced per request by
+# rewriting the outgoing request body — see browser.INTERCEPT_JS) and whether to use a
+# temporary chat. slug=None → no override (ChatGPT's currently selected model).
+# "auto" chooses a slug from the prompt (see _auto_pick_slug).
+MODELS: dict[str, dict] = {
+    "auto":             {"slug": None, "temporary": True, "auto": True},
+    "gpt-5.5":          {"slug": "gpt-5-5",          "temporary": True},
+    "gpt-5.5-instant":  {"slug": "gpt-5-5-instant",  "temporary": True},
+    "gpt-5.5-thinking": {"slug": "gpt-5-5-thinking", "temporary": True},
+    "gpt-5.4-thinking": {"slug": "gpt-5-4-thinking", "temporary": True},
+    "gpt-5.3":          {"slug": "gpt-5-3",          "temporary": True},
+    "o3":               {"slug": "o3",               "temporary": True},
+    # persistent (saved-history) option, uses whatever model ChatGPT has selected
+    "chatgpt":          {"slug": None, "temporary": False},
+}
+
+# "auto" routing: a complex/technical ask → reasoning model; otherwise a fast one.
+_AUTO_THINKING = os.environ.get("AUTO_THINKING_MODEL", "gpt-5-5-thinking")
+_AUTO_FAST = os.environ.get("AUTO_FAST_MODEL", "gpt-5-5-instant")
+_THINK_HINTS = (
+    "code", "function", "bug", "error", "traceback", "stack trace", "regex", "sql",
+    "algorithm", "optimi", "complexity", "prove", "proof", "theorem", "math",
+    "calculate", "equation", "derive", "step by step", "step-by-step", "reasoning",
+    "analyze", "explain in detail", "trade-off", "architecture", "debug", "refactor",
+    "démontre", "calcule", "étape par étape", "raisonne", "analyse", "explique en détail",
+    "pourquoi", "résous", "preuve", "équation", "compare", "comparer",
+)
+
+
+def _auto_pick_slug(prompt: str) -> str:
+    text = prompt or ""
+    low = text.lower()
+    if len(text) > 700 or "```" in text or any(h in low for h in _THINK_HINTS):
+        return _AUTO_THINKING
+    return _AUTO_FAST
 
 
 def _make_model_card(model_id: str) -> dict:
-    return {
-        "id": model_id,
-        "object": "model",
-        "created": 0,
-        "owned_by": "ripgpt",
-    }
+    return {"id": model_id, "object": "model", "created": 0, "owned_by": "ripgpt"}
 
 
 def _error_response(message: str, status_code: int = 400, error_type: str = "invalid_request_error", code: str | None = None):
@@ -61,11 +90,14 @@ def _error_response(message: str, status_code: int = 400, error_type: str = "inv
 
 
 def _resolve_model(model: str) -> str | None:
-    if model == MODEL_NAME:
-        return MODEL_NAME
-    if model == MODEL_NAME_PERSISTENT:
-        return MODEL_NAME_PERSISTENT
-    return None
+    return model if model in MODELS else None
+
+
+def _model_config(model: str, prompt: str) -> tuple[bool, str | None]:
+    """Return (temporary, slug) for a resolved model name, resolving 'auto' from the prompt."""
+    cfg = MODELS[model]
+    slug = _auto_pick_slug(prompt) if cfg.get("auto") else cfg.get("slug")
+    return cfg["temporary"], slug
 
 
 def _count_tokens(text: str) -> int:
@@ -195,7 +227,7 @@ def create_app() -> FastAPI:
     @app.get("/models")
     async def list_models(request: Request):
         _require_api_key(request)
-        return {"object": "list", "data": [_make_model_card(MODEL_NAME), _make_model_card(MODEL_NAME_PERSISTENT)]}
+        return {"object": "list", "data": [_make_model_card(m) for m in MODELS]}
 
     @app.get("/v1/models/{model}")
     @app.get("/models/{model}")
@@ -218,7 +250,6 @@ def create_app() -> FastAPI:
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
-        temporary = resolved_model != MODEL_NAME_PERSISTENT
 
         if is_meta_request(payload.messages):
             meta_answer = generate_meta_response(payload.messages)
@@ -228,6 +259,8 @@ def create_app() -> FastAPI:
         if not prompt:
             return _error_response("No user message provided.")
 
+        temporary, slug = _model_config(resolved_model, prompt)
+
         if payload.stream:
             return StreamingResponse(
                 _stream_chat_completion(
@@ -236,6 +269,7 @@ def create_app() -> FastAPI:
                     created=created,
                     model=resolved_model,
                     temporary=temporary,
+                    model_slug=slug,
                     stop=payload.stop,
                     include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
                 ),
@@ -244,7 +278,7 @@ def create_app() -> FastAPI:
             )
 
         try:
-            answer = SERVICE.ask(prompt, temporary=temporary)
+            answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug)
         except Exception as exc:
             return _error_response(str(exc), status_code=500, error_type="server_error")
 
@@ -267,7 +301,7 @@ def create_app() -> FastAPI:
 
         completion_id = f"cmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
-        temporary = resolved_model != MODEL_NAME_PERSISTENT
+        temporary, slug = _model_config(resolved_model, prompt)
 
         if payload.stream:
             return StreamingResponse(
@@ -277,6 +311,7 @@ def create_app() -> FastAPI:
                     created=created,
                     model=resolved_model,
                     temporary=temporary,
+                    model_slug=slug,
                     stop=payload.stop,
                 ),
                 media_type="text/event-stream",
@@ -284,7 +319,7 @@ def create_app() -> FastAPI:
             )
 
         try:
-            answer = SERVICE.ask(prompt, temporary=temporary)
+            answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug)
         except Exception as exc:
             return _error_response(str(exc), status_code=500, error_type="server_error")
 
@@ -309,6 +344,7 @@ async def _stream_chat_completion(
     created: int,
     model: str,
     temporary: bool,
+    model_slug: str | None,
     stop: str | list[str] | None,
     include_usage: bool,
 ):
@@ -325,7 +361,7 @@ async def _stream_chat_completion(
     yield f"data: {json.dumps(first_chunk)}\n\n"
 
     try:
-        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary)
+        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug)
     except Exception as exc:
         error_chunk = {
             "id": completion_id,
@@ -378,10 +414,11 @@ async def _stream_completion(
     created: int,
     model: str,
     temporary: bool,
+    model_slug: str | None,
     stop: str | list[str] | None,
 ):
     try:
-        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary)
+        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug)
     except Exception as exc:
         error_chunk = {
             "id": completion_id,

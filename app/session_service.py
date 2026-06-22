@@ -25,6 +25,7 @@ class SessionRequest:
     holder: dict | queue.Queue
     done_event: threading.Event
     stream: bool = False
+    model_slug: str | None = None
 
 
 class BrowserSessionService:
@@ -59,23 +60,23 @@ class BrowserSessionService:
         self._worker = None
         self._ready.clear()
 
-    def ask(self, prompt: str, temporary: bool = False, timeout: float = 330) -> str:
+    def ask(self, prompt: str, temporary: bool = False, model_slug: str | None = None, timeout: float = 330) -> str:
         self._ensure_ready()
         result: dict[str, str] = {}
         done_event = threading.Event()
-        self._request_queue.put(SessionRequest(prompt=prompt, temporary=temporary, holder=result, done_event=done_event))
+        self._request_queue.put(SessionRequest(prompt=prompt, temporary=temporary, holder=result, done_event=done_event, model_slug=model_slug))
         if not done_event.wait(timeout):
             raise TimeoutError("Browser session timed out waiting for a response.")
         if "error" in result:
             raise RuntimeError(result["error"])
         return result.get("answer", "")
 
-    def stream(self, prompt: str, temporary: bool = False) -> queue.Queue:
+    def stream(self, prompt: str, temporary: bool = False, model_slug: str | None = None) -> queue.Queue:
         self._ensure_ready()
         chunk_queue: queue.Queue = queue.Queue()
         done_event = threading.Event()
         self._request_queue.put(
-            SessionRequest(prompt=prompt, temporary=temporary, holder=chunk_queue, done_event=done_event, stream=True)
+            SessionRequest(prompt=prompt, temporary=temporary, holder=chunk_queue, done_event=done_event, stream=True, model_slug=model_slug)
         )
         return chunk_queue
 
@@ -132,11 +133,11 @@ class BrowserSessionService:
                 self._start_new_chat(temporary=request.temporary)
                 if request.stream:
                     assert isinstance(request.holder, queue.Queue)
-                    self._session.send(request.prompt)
+                    self._session.send(request.prompt, request.model_slug)
                     self._stream_answer_via_dom(self._session._page, request.holder)
                 else:
                     assert isinstance(request.holder, dict)
-                    answer = self._session.ask(request.prompt)
+                    answer = self._session.ask(request.prompt, request.model_slug)
                     request.holder["answer"] = answer
             except Exception as exc:
                 if request.stream:
