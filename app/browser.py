@@ -730,24 +730,27 @@ class ChatSession:
         self._page.keyboard.press("Enter")
 
     def is_alive(self) -> bool:
-        """Return True if the session is still logged in and the chat composer is accessible."""
+        """Lightweight, non-disruptive liveness check.
+
+        It NEVER navigates: the old version did a goto()+evaluate() that raced with
+        in-flight work ("Execution context was destroyed"), wrongly concluded the
+        session had died, and wedged the browser via a needless relogin. Here, any
+        transient error is treated as "alive" — a real request recovers on its own
+        through _start_new_chat / _ensure_composer. Only a clear logged-out state
+        (auth URL, or visible login buttons) counts as dead.
+        """
         try:
-            if "chatgpt.com/auth" in self._page.url:
+            url = self._page.url
+            if "/auth" in url or "/login" in url:
                 return False
-            composer = self._page.locator("#prompt-textarea")
-            if composer.is_visible():
+            # Composer already present on the current page → definitely alive.
+            if self._page.locator("#prompt-textarea").count() > 0:
                 return True
-            # Navigate to chatgpt.com to re-verify
-            self._page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=15_000)
-            self._page.evaluate(FETCH_INTERCEPT_JS)
-            if "chatgpt.com/auth" in self._page.url:
-                return False
-            composer = self._page.locator("#prompt-textarea")
-            composer.wait_for(state="visible", timeout=8_000)
-            return True
+            # Not on a chat page: only declare dead if the page clearly shows logged-out UI.
+            return not self._looks_logged_out()
         except Exception as exc:
-            _log(f"[session] Health check failed: {exc}")
-            return False
+            _log(f"[session] Health check inconclusive ({exc}); assuming alive.")
+            return True
 
     def relogin(self) -> None:
         """Recover a dropped session by reloading — the cookie persists on the context."""
