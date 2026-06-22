@@ -11,8 +11,10 @@ from contextlib import asynccontextmanager
 from typing import Iterable
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 
+from app.metrics import METRICS, classify_error
+from app.dashboard import DASHBOARD_HTML
 from app.openai_models import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -261,6 +263,9 @@ def create_app() -> FastAPI:
 
         temporary, slug = _model_config(resolved_model, prompt)
 
+        if SERVICE.is_paused():
+            return _error_response("Proxy is paused.", status_code=503, error_type="server_error", code="paused")
+
         if payload.stream:
             return StreamingResponse(
                 _stream_chat_completion(
@@ -277,12 +282,20 @@ def create_app() -> FastAPI:
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
+        t0 = time.time()
         try:
             answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug)
         except Exception as exc:
+            METRICS.record(model_req=resolved_model, model_res=slug, status="error",
+                           error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
             return _error_response(str(exc), status_code=500, error_type="server_error")
 
+        latency_ms = int((time.time() - t0) * 1000)
         answer = apply_stop_sequences(answer, payload.stop)
+        ok = bool(answer.strip())
+        METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
+                       error_class=None if ok else "empty_reply", latency_ms=latency_ms,
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
         return _make_chat_completion_response(completion_id, created, resolved_model, answer, prompt)
 
     @app.post("/v1/completions")
@@ -303,6 +316,9 @@ def create_app() -> FastAPI:
         created = int(time.time())
         temporary, slug = _model_config(resolved_model, prompt)
 
+        if SERVICE.is_paused():
+            return _error_response("Proxy is paused.", status_code=503, error_type="server_error", code="paused")
+
         if payload.stream:
             return StreamingResponse(
                 _stream_completion(
@@ -318,17 +334,53 @@ def create_app() -> FastAPI:
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
+        t0 = time.time()
         try:
             answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug)
         except Exception as exc:
+            METRICS.record(model_req=resolved_model, model_res=slug, status="error",
+                           error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
             return _error_response(str(exc), status_code=500, error_type="server_error")
 
+        latency_ms = int((time.time() - t0) * 1000)
         answer = apply_stop_sequences(answer, payload.stop)
+        ok = bool(answer.strip())
+        METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
+                       error_class=None if ok else "empty_reply", latency_ms=latency_ms,
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
         return _make_completion_response(completion_id, created, resolved_model, answer, prompt)
 
     @app.get("/health")
     async def health():
         return {"status": "ok", "session_ready": SERVICE.is_ready()}
+
+    @app.get("/")
+    @app.get("/dashboard")
+    async def dashboard():
+        return HTMLResponse(DASHBOARD_HTML)
+
+    @app.get("/stats")
+    async def stats(request: Request):
+        _require_api_key(request)
+        snap = METRICS.snapshot()
+        snap["live"] = SERVICE.live_state()
+        return snap
+
+    @app.post("/admin/restart-session")
+    async def admin_restart(request: Request):
+        _require_api_key(request)
+        ok = await asyncio.to_thread(SERVICE.request_restart)
+        return {"restarted": bool(ok)}
+
+    @app.post("/admin/pause")
+    async def admin_pause(request: Request):
+        _require_api_key(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        SERVICE.set_paused(bool(body.get("paused", not SERVICE.is_paused())))
+        return {"paused": SERVICE.is_paused()}
 
     return app
 
@@ -360,9 +412,12 @@ async def _stream_chat_completion(
     }
     yield f"data: {json.dumps(first_chunk)}\n\n"
 
+    t0 = time.time()
     try:
         answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug)
     except Exception as exc:
+        METRICS.record(model_req=model, model_res=model_slug, status="error",
+                       error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
         error_chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -375,6 +430,10 @@ async def _stream_chat_completion(
         return
 
     answer = apply_stop_sequences(answer, stop)
+    _ok = bool(answer.strip())
+    METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
+                   error_class=None if _ok else "empty_reply", latency_ms=int((time.time() - t0) * 1000),
+                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
     for piece in _chunk_text(answer):
         chunk = {
             "id": completion_id,
@@ -417,9 +476,12 @@ async def _stream_completion(
     model_slug: str | None,
     stop: str | list[str] | None,
 ):
+    t0 = time.time()
     try:
         answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug)
     except Exception as exc:
+        METRICS.record(model_req=model, model_res=model_slug, status="error",
+                       error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
         error_chunk = {
             "id": completion_id,
             "object": "text_completion",
@@ -432,6 +494,10 @@ async def _stream_completion(
         return
 
     answer = apply_stop_sequences(answer, stop)
+    _ok = bool(answer.strip())
+    METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
+                   error_class=None if _ok else "empty_reply", latency_ms=int((time.time() - t0) * 1000),
+                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
     for piece in _iter_markdown_chunks(answer):
         chunk = {
             "id": completion_id,

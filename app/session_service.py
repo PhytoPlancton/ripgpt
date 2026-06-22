@@ -26,6 +26,7 @@ class SessionRequest:
     done_event: threading.Event
     stream: bool = False
     model_slug: str | None = None
+    control: str | None = None   # e.g. "restart" — handled by the worker, not a chat turn
 
 
 class BrowserSessionService:
@@ -36,6 +37,12 @@ class BrowserSessionService:
         self._ready = threading.Event()
         self._worker: threading.Thread | None = None
         self._startup_error: Exception | None = None
+        # ── monitoring state ──
+        self._proxy_start_ts = time.time()
+        self._browser_start_ts: float | None = None
+        self._restart_count = 0
+        self._in_flight: dict | None = None
+        self._paused = False
 
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -51,6 +58,65 @@ class BrowserSessionService:
 
     def is_ready(self) -> bool:
         return self._ready.is_set() and self._startup_error is None
+
+    # ── monitoring / control ──────────────────────────────────────────────
+    def queue_depth(self) -> int:
+        return self._request_queue.qsize()
+
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def set_paused(self, value: bool) -> None:
+        self._paused = bool(value)
+
+    def request_restart(self, timeout: float = 120) -> bool:
+        """Ask the worker to recreate the browser session (one-click recovery)."""
+        self._ensure_ready()
+        done = threading.Event()
+        self._request_queue.put(SessionRequest(prompt="", temporary=False, holder={}, done_event=done, control="restart"))
+        return done.wait(timeout)
+
+    def _session_state(self) -> str:
+        if self._startup_error is not None:
+            return "browser_dead"
+        if not self._ready.is_set() or self._session is None:
+            return "starting"
+        if getattr(self._session, "logged_out", False):
+            return "logged_out"
+        return "logged_in"
+
+    def live_state(self) -> dict:
+        now = time.time()
+        inf = self._in_flight
+        in_flight = None
+        if inf:
+            in_flight = {"model": inf.get("model"), "age_s": round(now - inf.get("started", now), 1)}
+        return {
+            "session_state": self._session_state(),
+            "queue_depth": self.queue_depth(),
+            "in_flight": in_flight,
+            "proxy_uptime_s": round(now - self._proxy_start_ts),
+            "browser_uptime_s": round(now - self._browser_start_ts) if self._browser_start_ts else None,
+            "restart_count": self._restart_count,
+            "paused": self._paused,
+        }
+
+    def _do_restart(self) -> None:
+        logger.info("Restarting browser session (requested)...")
+        try:
+            if self._session is not None:
+                self._session.close()
+        except Exception:
+            pass
+        try:
+            self._session = browser.ChatSession()
+            self._browser_start_ts = time.time()
+            self._restart_count += 1
+            self._startup_error = None
+            logger.info("Browser session restarted.")
+        except Exception as exc:
+            self._startup_error = exc
+            logger.exception("Browser restart failed.")
 
     def stop(self) -> None:
         if not self._worker:
@@ -104,6 +170,7 @@ class BrowserSessionService:
         logger.info("Starting browser session...")
         try:
             self._session = browser.ChatSession()
+            self._browser_start_ts = time.time()
         except Exception as exc:
             self._startup_error = exc
             logger.exception("Browser session startup failed.")
@@ -129,6 +196,13 @@ class BrowserSessionService:
             if request is None:
                 break
 
+            if request.control == "restart":
+                self._do_restart()
+                request.done_event.set()
+                last_check = time.time()
+                continue
+
+            self._in_flight = {"model": request.model_slug or "auto", "started": time.time()}
             try:
                 self._start_new_chat(temporary=request.temporary)
                 if request.stream:
@@ -149,6 +223,7 @@ class BrowserSessionService:
                     request.holder["error"] = str(exc)
                 logger.error("Session error: %s", exc)
             finally:
+                self._in_flight = None
                 request.done_event.set()
                 # Session was just used — reset the health-check timer
                 last_check = time.time()

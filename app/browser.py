@@ -666,6 +666,7 @@ class ChatSession:
             locale="en-US",
         )
         self._page = self._context.new_page()
+        self.logged_out = False  # updated by _ensure_session; read by the metrics layer
 
         try:
             apply_stealth(self._page)
@@ -703,7 +704,8 @@ class ChatSession:
         # Composer is present both logged-in and in anonymous mode.
         _dismiss_dialogs(self._page)
         _ensure_composer(self._page)
-        if _has_auth() and self._looks_logged_out():
+        self.logged_out = bool(_has_auth() and self._looks_logged_out())
+        if self.logged_out:
             _log("[browser] WARNING: token set but page looks logged-out — "
                  "CHATGPT_SESSION_TOKEN may be expired (running anonymously).")
 

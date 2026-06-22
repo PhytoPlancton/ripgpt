@@ -79,8 +79,24 @@ docker compose up --build
 |---|---|---|
 | **Open WebUI** | http://localhost:3001 | ChatGPT-like web interface |
 | **ripgpt API** | http://localhost:8850 | the OpenAI-compatible endpoint |
+| **Console** | http://localhost:8850/ | live monitoring dashboard (see below) |
 
 First visit to Open WebUI asks you to create a **local** account, then pick the `chatgpt` model and go.
+
+## 📊 Monitoring console
+
+Open **http://localhost:8850/** and paste your API key. A live dashboard (refreshes every
+4s, pauses when the tab is hidden) shows exactly what matters for a single-browser proxy:
+
+- **Health strip** — session state · queue depth · 15-min error rate · **wedge risk**
+  (consecutive empty/timeout = ChatGPT anti-abuse biting; your #1 failure mode).
+- **Requests over time** (ok vs error), **latency p50/p95 per model**, and a **recent-requests
+  table** (model routed, status, latency coloured vs that model's p95, ~tokens).
+- Loud banners on *logged-out* and *wedge*, a one-click **restart session** button, and a
+  Three.js particle sphere that breathes with traffic and turns red when unhealthy. 🟢→🔴
+
+Powered by `GET /stats` (JSON, behind the API key). Deliberately **omits** vanity metrics
+(RPS, exact tokens, cost, uptime SLAs, mean latency).
 
 ## 🔑 Authentication (your session cookie)
 
