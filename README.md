@@ -104,7 +104,7 @@ its own. If CF blocks you, run locally with `HEADLESS=false`, or set `INJECT_CF_
 curl http://localhost:8850/v1/chat/completions \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
-  -d '{"model":"chatgpt-temporary","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"auto","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 ```python
@@ -112,13 +112,31 @@ from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8850/v1", api_key="ripgpt-local")
 resp = client.chat.completions.create(
-    model="chatgpt-temporary",
+    model="auto",   # or gpt-5.5-thinking, o3, …
     messages=[{"role": "user", "content": "Tell me a fun fact about the Roman Empire"}],
 )
 print(resp.choices[0].message.content)
 ```
 
-**Models:** `chatgpt` (persistent chat, kept in history) · `chatgpt-temporary` (temporary chat, nothing saved).
+### Models
+
+The requested model is **forced per request** by rewriting the outgoing conversation
+request (robust, no fragile UI-menu clicking) — verified end-to-end via the model the
+server reports back.
+
+| Model | Behaviour |
+|---|---|
+| `auto` | picks from your prompt — a fast model for simple asks, a thinking model when it smells like code / math / reasoning / long input |
+| `gpt-5.5` · `gpt-5.5-instant` · `gpt-5.5-thinking` | the GPT‑5.5 tiers |
+| `gpt-5.4-thinking` · `gpt-5.3` · `o3` | other models |
+| `chatgpt` | uses whatever model is selected in ChatGPT, and **saves** the chat to your history (the rest are temporary) |
+
+> [!IMPORTANT]
+> ripgpt drives a **single** browser through ChatGPT's real anti-abuse. Firing requests
+> too fast trips rate-limits and wedges the session (empty replies / endless "Thinking").
+> Keep it to a calm, sequential pace. If it gets stuck: `docker compose restart api`.
+
+> Tip: `docker logs llmonline-api-1 | grep model_slug` shows which model actually answered.
 
 ## ⚙️ Configuration (`.env`)
 
