@@ -1,0 +1,53 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8850:8850"
+    environment:
+      - API_PORT=8850
+      - DEFAULT_MODEL=chatgpt-temporary
+      - PERSISTENT_MODEL=chatgpt
+      - VERBOSE=true
+      - HEADLESS=true
+      - SESSION_CHECK_INTERVAL=900
+      - ANSWER_TIMEOUT=300
+      - API_KEY=${API_KEY}
+      - CHATGPT_SESSION_TOKEN=${CHATGPT_SESSION_TOKEN:-}
+      - CHATGPT_COOKIES=${CHATGPT_COOKIES:-}
+      - INJECT_CF_COOKIES=${INJECT_CF_COOKIES:-false}
+    restart: unless-stopped
+    healthcheck:
+      # The app only starts serving once the browser session is ready, so a 200
+      # here means ripgpt is actually usable. start_period is generous because the
+      # first login + Cloudflare pass can take a while.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8850/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 180s
+
+  # ChatGPT-like web UI in front of the ripgpt OpenAI-compatible API.
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "${OPENWEBUI_PORT:-3001}:8080"   # open http://localhost:3001 (3000 was taken)
+    environment:
+      - OPENAI_API_BASE_URL=http://api:8850/v1   # talk to ripgpt over the compose network
+      - OPENAI_API_KEY=${API_KEY}                # must match ripgpt's API_KEY
+      - ENABLE_OLLAMA_API=false                  # we only use the ripgpt backend
+      - WEBUI_AUTH=${WEBUI_AUTH:-true}           # set false in .env for no-login local use
+      # ripgpt drives a SINGLE browser, so avoid OpenWebUI's extra background LLM calls
+      # (title/tags/autocomplete/RAG-query) that would otherwise thrash the queue.
+      - ENABLE_TITLE_GENERATION=false
+      - ENABLE_TAGS_GENERATION=false
+      - ENABLE_AUTOCOMPLETE_GENERATION=false
+      - ENABLE_RETRIEVAL_QUERY_GENERATION=false
+    volumes:
+      - open-webui:/app/backend/data
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  open-webui:
