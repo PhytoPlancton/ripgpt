@@ -267,10 +267,16 @@ tick();
     pos[i*3]=r*Math.sin(ph)*Math.cos(th); pos[i*3+1]=r*Math.sin(ph)*Math.sin(th); pos[i*3+2]=r*Math.cos(ph); }
   const g=new THREE.BufferGeometry(); g.setAttribute('position',new THREE.BufferAttribute(pos,3));
   const mat=new THREE.PointsMaterial({size:0.035,color:0x39d98a,transparent:true,opacity:0.9});
-  const pts=new THREE.Points(g,mat); sc.add(pts);
+  const group=new THREE.Group(); sc.add(group);
+  const pts=new THREE.Points(g,mat); group.add(pts);
   const wire=new THREE.Mesh(new THREE.IcosahedronGeometry(0.85,1),
     new THREE.MeshBasicMaterial({color:0x1d2940,wireframe:true,transparent:true,opacity:0.6}));
-  sc.add(wire);
+  group.add(wire);
+  // cursor tracking — the sphere leans toward the pointer (+ subtle camera parallax)
+  let mx=0,my=0,tmx=0,tmy=0;
+  host.addEventListener('pointermove',e=>{ const r=host.getBoundingClientRect();
+    tmx=((e.clientX-r.left)/r.width)*2-1; tmy=((e.clientY-r.top)/r.height)*2-1; });
+  host.addEventListener('pointerleave',()=>{ tmx=0; tmy=0; });
   function lerp(a,b,t){return a+(b-a)*t;}
   function col(h){ // green -> amber -> red
     const g1=[0x39,0xd9,0x8a], a1=[0xff,0xb4,0x54], r1=[0xff,0x5c,0x7c];
@@ -282,6 +288,13 @@ tick();
     threeState.pulse=Math.max(0,threeState.pulse-0.02);
     const spin=0.0015 + threeState.cur*0.006 + threeState.pulse*0.02;
     pts.rotation.y+=spin; pts.rotation.x+=spin*0.4; wire.rotation.y-=spin*0.6;
+    // ease toward the cursor and lean the whole sphere that way + parallax the camera
+    mx+=(tmx-mx)*0.06; my+=(tmy-my)*0.06;
+    group.rotation.y += (mx*0.7 - group.rotation.y)*0.08;
+    group.rotation.x += (my*0.5 - group.rotation.x)*0.08;
+    cam.position.x += (mx*0.5 - cam.position.x)*0.05;
+    cam.position.y += (-my*0.4 - cam.position.y)*0.05;
+    cam.lookAt(0,0,0);
     const s=1+threeState.pulse*0.15+Math.sin(Date.now()/700)*0.01*(1+threeState.cur*4);
     pts.scale.set(s,s,s);
     const c=col(threeState.cur); mat.color.setHex(c); mat.opacity=0.55+threeState.pulse*0.4;
