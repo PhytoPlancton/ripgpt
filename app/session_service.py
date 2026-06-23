@@ -118,6 +118,26 @@ class BrowserSessionService:
             self._startup_error = exc
             logger.exception("Browser restart failed.")
 
+    def _run_turn(self, request: "SessionRequest") -> None:
+        """Execute one chat turn (stream or not). Raises on failure (e.g. wedged composer)."""
+        self._start_new_chat(temporary=request.temporary)
+        if request.stream:
+            assert isinstance(request.holder, queue.Queue)
+            self._session.send(request.prompt, request.model_slug)
+            self._stream_answer_via_dom(self._session._page, request.holder)
+        else:
+            assert isinstance(request.holder, dict)
+            request.holder["answer"] = self._session.ask(request.prompt, request.model_slug)
+
+    def _put_error(self, request: "SessionRequest", exc: Exception) -> None:
+        if request.stream:
+            assert isinstance(request.holder, queue.Queue)
+            request.holder.put({"error": str(exc)})
+            request.holder.put(None)
+        else:
+            assert isinstance(request.holder, dict)
+            request.holder["error"] = str(exc)
+
     def stop(self) -> None:
         if not self._worker:
             return
@@ -204,24 +224,23 @@ class BrowserSessionService:
 
             self._in_flight = {"model": request.model_slug or "auto", "started": time.time()}
             try:
-                self._start_new_chat(temporary=request.temporary)
-                if request.stream:
-                    assert isinstance(request.holder, queue.Queue)
-                    self._session.send(request.prompt, request.model_slug)
-                    self._stream_answer_via_dom(self._session._page, request.holder)
-                else:
-                    assert isinstance(request.holder, dict)
-                    answer = self._session.ask(request.prompt, request.model_slug)
-                    request.holder["answer"] = answer
+                self._run_turn(request)
             except Exception as exc:
-                if request.stream:
-                    assert isinstance(request.holder, queue.Queue)
-                    request.holder.put({"error": str(exc)})
-                    request.holder.put(None)
+                # Self-heal: a wedged composer (timeout waiting for #prompt-textarea) means
+                # the browser is stuck — recreate it and retry the turn once, instead of
+                # requiring a manual `docker compose restart api`.
+                wedged = ("prompt-textarea" in str(exc)) or ("Timeout" in str(exc)) or ("composer" in str(exc).lower())
+                if wedged:
+                    logger.warning("Session wedged (%s) — recreating browser and retrying once.", str(exc)[:80])
+                    self._do_restart()
+                    try:
+                        self._run_turn(request)
+                    except Exception as exc2:
+                        self._put_error(request, exc2)
+                        logger.error("Retry after restart failed: %s", exc2)
                 else:
-                    assert isinstance(request.holder, dict)
-                    request.holder["error"] = str(exc)
-                logger.error("Session error: %s", exc)
+                    self._put_error(request, exc)
+                    logger.error("Session error: %s", exc)
             finally:
                 self._in_flight = None
                 request.done_event.set()
