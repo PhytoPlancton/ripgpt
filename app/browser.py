@@ -551,17 +551,56 @@ def _is_generating(page) -> bool:
 
 
 def _dismiss_dialogs(page):
-    """Best-effort: close cookie banners / onboarding / upsell modals hiding the composer."""
+    """Best-effort: close cookie banners / onboarding / upsell modals hiding the composer.
+
+    ChatGPT often opens a blurred overlay (data-testid=modal-beacon) that intercepts the
+    click on the composer. Escape closes most of them; we also click common close /
+    affirmative buttons.
+    """
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.15)
+    except Exception:
+        pass
+    for sel in ['[data-testid="close-button"]', 'button[aria-label="Close"]',
+                'button[aria-label="Fermer"]', 'button[aria-label*="close" i]']:
+        try:
+            b = page.locator(sel).first
+            if b.is_visible(timeout=300):
+                b.click(timeout=1500)
+                time.sleep(0.2)
+        except Exception:
+            pass
     labels = ["Reject non-essential", "Accept all", "Accept", "Stay logged out",
-              "Got it", "Okay, let's go", "Maybe later", "Not now", "Dismiss", "Close", "No thanks"]
+              "Got it", "Okay, let's go", "Okay", "Maybe later", "Not now", "Dismiss", "Close", "No thanks"]
     for t in labels:
         try:
             btn = page.locator(f'button:has-text("{t}")').first
-            if btn.is_visible(timeout=400):
+            if btn.is_visible(timeout=300):
                 btn.click(timeout=1500)
                 time.sleep(0.2)
         except Exception:
             pass
+
+
+def _focus_composer(page):
+    """Dismiss any modal covering the composer, then click it — with retries.
+
+    Fixes 'modal-beacon subtree intercepts pointer events' on a fresh session.
+    """
+    comp = page.locator("#prompt-textarea")
+    for _ in range(3):
+        _dismiss_dialogs(page)
+        try:
+            comp.click(timeout=8000)
+            return
+        except Exception:
+            time.sleep(0.4)
+    # last resort: focus via JS (bypasses the overlay intercept)
+    try:
+        page.evaluate("() => { const e = document.querySelector('#prompt-textarea'); if (e) e.focus(); }")
+    except Exception:
+        pass
 
 
 def _ensure_composer(page, timeout=30000):
@@ -735,8 +774,7 @@ class ChatSession:
         self._page.evaluate(RESET_SSE_JS)
         _ensure_composer(self._page)
         self._apply_model(model_slug)
-        composer = self._page.locator("#prompt-textarea")
-        composer.click()
+        _focus_composer(self._page)
         self._page.keyboard.type(question, delay=20)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")
@@ -748,8 +786,7 @@ class ChatSession:
         self._page.evaluate(RESET_SSE_JS)
         _ensure_composer(self._page)
         self._apply_model(model_slug)
-        composer = self._page.locator("#prompt-textarea")
-        composer.click()
+        _focus_composer(self._page)
         self._page.keyboard.type(question, delay=20)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")
