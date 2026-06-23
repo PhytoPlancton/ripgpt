@@ -59,6 +59,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   @media(max-width:760px){.row2{grid-template-columns:1fr}}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
   .card h3{margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);font-weight:600}
+  .chartbox{position:relative;height:190px;width:100%}
   table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
   th{text-align:left;color:var(--muted);font-weight:500;padding:6px 8px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel)}
   td{padding:6px 8px;border-bottom:1px solid #131c2c;white-space:nowrap}
@@ -98,8 +99,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <!-- charts -->
   <div class="grid row2" style="margin-top:12px">
-    <div class="card"><h3>Requests over time · ok vs error (1-min)</h3><canvas id="reqChart" height="150"></canvas></div>
-    <div class="card"><h3>Latency by model · p50 / p95 (ms, last hour)</h3><canvas id="latChart" height="150"></canvas></div>
+    <div class="card"><h3>Requests over time · ok vs error (1-min)</h3><div class="chartbox"><canvas id="reqChart"></canvas></div></div>
+    <div class="card"><h3>Latency by model · p50 / p95 (ms, last hour)</h3><div class="chartbox"><canvas id="latChart"></canvas></div></div>
   </div>
 
   <!-- recent requests -->
