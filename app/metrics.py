@@ -45,15 +45,19 @@ class Metrics:
         self.last_success_ts: float | None = None
         self.consecutive_failures = 0
         self.consecutive_empty_or_timeout = 0
+        self.started_ts = time.time()
+        # Cumulative per-model counters that survive the ring buffer (true all-time).
+        self._lifetime: dict[str, dict] = {}
 
     def record(self, *, model_req: str, model_res: str | None, status: str,
                error_class: str | None, latency_ms: int,
                ptoks: int = 0, ctoks: int = 0) -> None:
         now = time.time()
+        mres = model_res or model_req
         rec = {
             "ts": now,
             "model_req": model_req,
-            "model_res": model_res or model_req,
+            "model_res": mres,
             "status": status,                       # "ok" | "error"
             "error_class": error_class,
             "latency_ms": int(latency_ms),
@@ -62,11 +66,22 @@ class Metrics:
         }
         with self._lock:
             self._recent.append(rec)
+            lt = self._lifetime.setdefault(
+                mres, {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
+                       "last_ts": None, "lat_sum": 0, "lat_n": 0})
+            lt["req"] += 1
+            lt["last_ts"] = now
+            lt["ptoks"] += int(ptoks)
+            lt["ctoks"] += int(ctoks)
             if status == "ok":
+                lt["ok"] += 1
+                lt["lat_sum"] += int(latency_ms)
+                lt["lat_n"] += 1
                 self.last_success_ts = now
                 self.consecutive_failures = 0
                 self.consecutive_empty_or_timeout = 0
             else:
+                lt["err"] += 1
                 self.consecutive_failures += 1
                 if error_class in ("empty_reply", "composer_timeout", "timeout"):
                     self.consecutive_empty_or_timeout += 1
@@ -82,6 +97,8 @@ class Metrics:
             cons_fail = self.consecutive_failures
             cons_empty = self.consecutive_empty_or_timeout
             last_ok = self.last_success_ts
+            started = self.started_ts
+            lifetime = {m: dict(d) for m, d in self._lifetime.items()}
 
         last_15 = self._window(recs, 900, now)
         prev_15 = [r for r in recs if now - 1800 <= r["ts"] < now - 900]
@@ -99,6 +116,33 @@ class Metrics:
             {"model": m, "count": len(v), "p50": int(_percentile(v, 50)), "p95": int(_percentile(v, 95))}
             for m, v in sorted(by_model.items(), key=lambda kv: -len(kv[1]))
         ]
+        hour_p95 = {m: int(_percentile(v, 95)) for m, v in by_model.items()}
+
+        # cumulative all-time usage per model (Perplexity-style panel)
+        by_model_usage = []
+        for m, d in lifetime.items():
+            req = d["req"] or 0
+            by_model_usage.append({
+                "model": m,
+                "requests": req,
+                "ok": d["ok"],
+                "err": d["err"],
+                "success_rate": round(d["ok"] / req, 4) if req else 0.0,
+                "ctoks": d["ctoks"],
+                "ptoks": d["ptoks"],
+                "avg_latency_ms": int(d["lat_sum"] / d["lat_n"]) if d["lat_n"] else 0,
+                "p95_latency_ms": hour_p95.get(m, 0),
+                "last_ts": d["last_ts"],
+            })
+        by_model_usage.sort(key=lambda x: -x["requests"])
+        life_total = {
+            "requests": sum(d["req"] for d in lifetime.values()),
+            "ok": sum(d["ok"] for d in lifetime.values()),
+            "err": sum(d["err"] for d in lifetime.values()),
+            "ctoks": sum(d["ctoks"] for d in lifetime.values()),
+            "models": len(lifetime),
+            "since": started,
+        }
 
         # error breakdown (last hour)
         by_error: dict[str, int] = {}
@@ -137,6 +181,8 @@ class Metrics:
             "last_success_ts": last_ok,
             "seconds_since_success": (now - last_ok) if last_ok else None,
             "by_model_latency": model_latency,
+            "by_model_usage": by_model_usage,
+            "lifetime": life_total,
             "by_error_class": by_error,
             "series": series,
             "recent": recent,

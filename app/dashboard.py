@@ -66,6 +66,17 @@ DASHBOARD_HTML = r"""<!doctype html>
   .tbl-wrap{max-height:360px;overflow:auto}
   .tag{font-size:10px;padding:1px 6px;border-radius:5px;border:1px solid var(--line)}
   .muted{color:var(--muted)}
+  .usage-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:10px}
+  .ucard{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 13px;transition:.15s}
+  .ucard:hover{border-color:#34507f}
+  .ucard .um{font-family:var(--mono);font-size:13px;color:var(--cyan);font-weight:600;display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+  .ucard .um .share{font-size:10px;color:var(--muted);font-weight:400}
+  .ucard .un{font-family:var(--mono);font-size:30px;font-weight:600;line-height:1.1;margin:7px 0 1px}
+  .ucard .ul{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+  .bar{height:6px;border-radius:4px;background:#19233500;background-color:#19233a;margin:10px 0 8px;overflow:hidden}
+  .bar > i{display:block;height:100%;border-radius:4px;transition:width .4s}
+  .ustats{display:flex;flex-wrap:wrap;gap:3px 12px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .ustats b{color:var(--text);font-weight:600}
   #keybar{display:none;margin-top:40px;text-align:center}
   input{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line);color:var(--text);
         padding:9px 11px;border-radius:8px;width:340px;max-width:80%}
@@ -101,6 +112,12 @@ DASHBOARD_HTML = r"""<!doctype html>
   <div class="grid row2" style="margin-top:12px">
     <div class="card"><h3>Requests over time · ok vs error (1-min)</h3><div class="chartbox"><canvas id="reqChart"></canvas></div></div>
     <div class="card"><h3>Latency by model · p50 / p95 (ms, last hour)</h3><div class="chartbox"><canvas id="latChart"></canvas></div></div>
+  </div>
+
+  <!-- usage by model (Perplexity-style cards) -->
+  <div class="card" style="margin-top:12px">
+    <h3>Usage by model · all-time <span id="usageTotals" class="muted" style="text-transform:none;letter-spacing:0;font-weight:400"></span></h3>
+    <div class="usage-grid" id="usageGrid"><div class="muted">waiting for data…</div></div>
   </div>
 
   <!-- recent requests -->
@@ -180,6 +197,7 @@ function render(s){
 
   // ── charts ──
   drawReq(s.series); drawLat(s.by_model_latency);
+  drawUsage(s);
   drawRecent(s.recent);
 
   // ── three.js state: health 0(calm green)..1(red), pulse on traffic ──
@@ -188,6 +206,37 @@ function render(s){
   const lastN = s.recent[0]; if(lastN){ const age=Date.now()/1000-lastN.ts; if(age<5) threeState.pulse=1; }
   $('heroState').innerHTML = ss[0]==='LOGGED IN'
     ? '<span class="ok">● online</span>' : '<span class="bad">● '+ss[0].toLowerCase()+'</span>';
+}
+
+function fmtN(n){ if(n>=1e6) return (n/1e6).toFixed(1)+'M'; if(n>=1000) return (n/1000).toFixed(n>=10000?0:1)+'k'; return ''+n; }
+function drawUsage(s){
+  const lt=s.lifetime||{requests:0,models:0,ctoks:0};
+  $('usageTotals').textContent = lt.requests
+    ? '· '+lt.requests+' requests · '+lt.models+' models · ~'+fmtN(lt.ctoks||0)+' tokens out'
+    : '';
+  const arr=s.by_model_usage||[];
+  if(!arr.length){ $('usageGrid').innerHTML='<div class="muted">no requests yet</div>'; return; }
+  const total=arr.reduce((a,m)=>a+m.requests,0)||1;
+  $('usageGrid').innerHTML = arr.map(m=>{
+    const sr=Math.round(m.success_rate*100);
+    const col = sr>=95?'var(--green)':sr>=80?'var(--amber)':'var(--red)';
+    const share=Math.round(100*m.requests/total);
+    const p95=m.p95_latency_ms?((m.p95_latency_ms/1000).toFixed(1)+'s'):'—';
+    const tok=m.ctoks?('~'+fmtN(m.ctoks)):'—';
+    return `<div class="ucard">
+      <div class="um"><span>${m.model}</span><span class="share">${share}% of traffic</span></div>
+      <div class="un">${m.requests}</div>
+      <div class="ul">requests · ${sr}% success</div>
+      <div class="bar"><i style="width:${sr}%;background:${col}"></i></div>
+      <div class="ustats">
+        <span><b class="ok">${m.ok}</b> ok</span>
+        <span><b style="color:${m.err?'var(--red)':'var(--muted)'}">${m.err}</b> err</span>
+        <span>p95 <b>${p95}</b></span>
+        <span>out <b>${tok}</b></span>
+        <span>last <b>${rel(m.last_ts)}</b></span>
+      </div>
+    </div>`;
+  }).join('');
 }
 
 function statusCell(r){
