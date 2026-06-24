@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import queue
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Iterable
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 
 from app.metrics import METRICS, classify_error
 from app.dashboard import DASHBOARD_HTML
+from app.imagestore import IMAGES, ext_for
 from app.openai_models import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -108,6 +111,64 @@ def _model_config(model: str, prompt: str) -> tuple[bool, str | None, bool]:
 
 def _count_tokens(text: str) -> int:
     return len(text.split())
+
+
+# Public origin used to build image URLs. OpenWebUI calls us server-to-server, so the
+# request Host is the internal docker address — that URL is unreachable from the user's
+# browser. PUBLIC_BASE_URL (e.g. http://localhost:8850 or https://ripgpt.nmt.ovh) wins;
+# we fall back to the request origin for callers that hit ripgpt directly.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+
+_DATA_URL_RE = re.compile(r"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)")
+
+
+def _base_url(request: Request) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}"
+
+
+def _sniff_image_mime(raw: bytes) -> str | None:
+    """Detect a raster image type from its magic bytes — None for anything else.
+
+    We host (and later serve from our own origin) ONLY genuine raster images. SVG and
+    spoofed/arbitrary bytes are deliberately rejected: serving attacker-controlled
+    image/svg+xml from the public /images route would execute script on our origin.
+    """
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _externalize_images(answer: str, base_url: str) -> str:
+    """Replace inline base64 image data URLs with short ripgpt-hosted URLs.
+
+    Multi-MB data URLs render as raw text in OpenWebUI; a short URL renders as an image.
+    Only real raster images are hosted; everything else is left inline (see _sniff).
+    """
+    if not answer or "data:image" not in answer:
+        return answer
+
+    def repl(m: "re.Match") -> str:
+        try:
+            raw = base64.b64decode(re.sub(r"\s+", "", m.group(2)))
+        except Exception:
+            return m.group(0)
+        sniffed = _sniff_image_mime(raw)
+        if not sniffed:
+            return m.group(0)   # not a genuine raster image — leave inline, never host
+        iid = IMAGES.put(raw, sniffed)   # trust the sniffed type, not the claimed mime
+        return f"{base_url}/images/{iid}.{ext_for(sniffed)}"
+
+    return _DATA_URL_RE.sub(repl, answer)
 
 
 def _make_usage(prompt: str, content: str) -> dict[str, int]:
@@ -280,6 +341,7 @@ def create_app() -> FastAPI:
                     temporary=temporary,
                     model_slug=slug,
                     image=image,
+                    base_url=_base_url(request),
                     stop=payload.stop,
                     include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
                 ),
@@ -296,6 +358,7 @@ def create_app() -> FastAPI:
             return _error_response(str(exc), status_code=500, error_type="server_error")
 
         latency_ms = int((time.time() - t0) * 1000)
+        answer = _externalize_images(answer, _base_url(request))
         answer = apply_stop_sequences(answer, payload.stop)
         ok = bool(answer.strip())
         METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
@@ -334,6 +397,7 @@ def create_app() -> FastAPI:
                     temporary=temporary,
                     model_slug=slug,
                     image=image,
+                    base_url=_base_url(request),
                     stop=payload.stop,
                 ),
                 media_type="text/event-stream",
@@ -349,6 +413,7 @@ def create_app() -> FastAPI:
             return _error_response(str(exc), status_code=500, error_type="server_error")
 
         latency_ms = int((time.time() - t0) * 1000)
+        answer = _externalize_images(answer, _base_url(request))
         answer = apply_stop_sequences(answer, payload.stop)
         ok = bool(answer.strip())
         METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
@@ -359,6 +424,24 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok", "session_ready": SERVICE.is_ready()}
+
+    @app.get("/images/{iid}")
+    async def get_image(iid: str):
+        # No API key: an <img> tag can't send Authorization headers. The 32-char
+        # uuid is the unguessable capability; images are ephemeral (TTL + cap).
+        got = IMAGES.get(iid.split(".")[0])
+        if not got:
+            return _error_response("Image not found or expired.", status_code=404,
+                                   error_type="invalid_request_error", code="not_found")
+        data, mime = got
+        # Stored mime is always a sniffed raster type; nosniff + inline disposition are
+        # defence-in-depth so the browser never treats served bytes as an active document.
+        # Cache no longer than the in-memory TTL so dead URLs aren't trusted for 24h.
+        return Response(content=data, media_type=mime, headers={
+            "Cache-Control": "public, max-age=10800",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": f'inline; filename="{iid.split(".")[0]}.{ext_for(mime)}"',
+        })
 
     @app.get("/")
     @app.get("/dashboard")
@@ -404,6 +487,7 @@ async def _stream_chat_completion(
     temporary: bool,
     model_slug: str | None,
     image: bool,
+    base_url: str,
     stop: str | list[str] | None,
     include_usage: bool,
 ):
@@ -436,6 +520,7 @@ async def _stream_chat_completion(
         yield "data: [DONE]\n\n"
         return
 
+    answer = _externalize_images(answer, base_url)
     answer = apply_stop_sequences(answer, stop)
     _ok = bool(answer.strip())
     METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
@@ -482,6 +567,7 @@ async def _stream_completion(
     temporary: bool,
     model_slug: str | None,
     image: bool,
+    base_url: str,
     stop: str | list[str] | None,
 ):
     t0 = time.time()
@@ -501,6 +587,7 @@ async def _stream_completion(
         yield "data: [DONE]\n\n"
         return
 
+    answer = _externalize_images(answer, base_url)
     answer = apply_stop_sequences(answer, stop)
     _ok = bool(answer.strip())
     METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",

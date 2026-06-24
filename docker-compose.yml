@@ -9,6 +9,9 @@ services:
       - HEADLESS=true
       - SESSION_CHECK_INTERVAL=900
       - ANSWER_TIMEOUT=300
+      # Public origin used to build image URLs (must be reachable from the user's
+      # browser). Local default; on EDJ set PUBLIC_BASE_URL=https://ripgpt.nmt.ovh.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://localhost:8850}
       - API_KEY=${API_KEY}
       - CHATGPT_SESSION_TOKEN=${CHATGPT_SESSION_TOKEN:-}
       - CHATGPT_COOKIES=${CHATGPT_COOKIES:-}
