@@ -25,8 +25,10 @@ from app.openai_models import (
     extract_last_user_message,
     generate_meta_response,
     is_meta_request,
+    last_user_attachment_kind,
     normalize_stop_sequences,
     prompt_from_completion_request,
+    serialize_messages,
 )
 from app.session_service import BrowserSessionService
 
@@ -109,8 +111,21 @@ def _model_config(model: str, prompt: str) -> tuple[bool, str | None, bool]:
     return cfg["temporary"], slug, bool(cfg.get("image"))
 
 
+try:
+    import tiktoken
+    _ENCODER = tiktoken.get_encoding("o200k_base")   # GPT-4o/5-era vocab
+    log.info("tiktoken loaded (o200k_base) for token counting.")
+except Exception as _exc:  # pragma: no cover - offline / missing vocab
+    _ENCODER = None
+    logging.getLogger("ripgpt.api").warning("tiktoken unavailable (%s) — approximating tokens.", _exc)
+
+
 def _count_tokens(text: str) -> int:
-    return len(text.split())
+    if not text:
+        return 0
+    if _ENCODER is not None:
+        return len(_ENCODER.encode(text))
+    return max(1, len(text) // 4)   # ~4 chars/token approximation
 
 
 # Public origin used to build image URLs. OpenWebUI calls us server-to-server, so the
@@ -327,7 +342,14 @@ def create_app() -> FastAPI:
             meta_answer = generate_meta_response(payload.messages)
             return _make_chat_completion_response(completion_id, created, resolved_model, meta_answer, "")
 
-        prompt = extract_last_user_message(payload.messages)
+        attachment = last_user_attachment_kind(payload.messages)
+        if attachment:
+            return _error_response(
+                f"This model is text-only — '{attachment}' input is not supported yet. "
+                "Remove the attachment and send text.",
+                status_code=400, error_type="invalid_request_error", code="unsupported_input")
+
+        prompt = serialize_messages(payload.messages)
         if not prompt:
             return _error_response("No user message provided.")
 

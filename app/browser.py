@@ -911,7 +911,9 @@ class ChatSession:
         _ensure_composer(self._page)
         self._apply_model(model_slug)
         _focus_composer(self._page)
-        self._page.keyboard.type(question, delay=20)
+        # insertText pastes the whole prompt at once; char-by-char typing would take
+        # minutes for a folded multi-turn transcript (and is fragile).
+        self._page.keyboard.insert_text(question)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")
         return _wait_for_answer(self._page, image=image)
@@ -923,7 +925,7 @@ class ChatSession:
         _ensure_composer(self._page)
         self._apply_model(model_slug)
         _focus_composer(self._page)
-        self._page.keyboard.type(question, delay=20)
+        self._page.keyboard.insert_text(question)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")
 

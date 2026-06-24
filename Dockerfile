@@ -14,7 +14,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && \
     playwright install firefox && \
-    playwright install-deps firefox
+    playwright install-deps firefox && \
+    python -c "import tiktoken; tiktoken.get_encoding('o200k_base')"   # pre-cache vocab in the image
 
 COPY app ./app
 

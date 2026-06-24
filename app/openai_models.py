@@ -79,6 +79,67 @@ def extract_last_user_message(messages: list[ChatMessage]) -> str:
     return last_user_message.strip()
 
 
+# ChatGPT has no system role and no native multi-turn for our one-shot fresh chats, so
+# we fold the whole conversation (system + history) into a single transcript prompt.
+MAX_PROMPT_CHARS = 12000
+
+
+def serialize_messages(messages: list[ChatMessage]) -> str:
+    """Flatten system + conversation history into one prompt for ChatGPT.
+
+    Single user message with no system/history → returned verbatim (back-compat).
+    Otherwise: system folded as a preamble, prior turns labelled, newest kept within
+    a char budget (oldest middle turns dropped first; system + latest always kept).
+    """
+    system_parts: list[str] = []
+    turns: list[tuple[str, str]] = []
+    for m in messages:
+        text = content_to_text(m.content)
+        if not text:
+            continue
+        if m.role in ("system", "developer"):
+            system_parts.append(text)
+        elif m.role in ("user", "assistant"):
+            turns.append((m.role, text))
+        # tool messages are not representable in the ChatGPT UI — skip.
+    if not turns:
+        return ""
+
+    system = "\n\n".join(system_parts).strip()
+    if not system and len(turns) == 1 and turns[0][0] == "user":
+        return turns[0][1]   # plain single-turn prompt — unchanged behaviour
+
+    label = {"user": "User", "assistant": "Assistant"}
+    rendered = [f"{label[r]}: {t}" for r, t in turns]
+    budget = MAX_PROMPT_CHARS - (len(system) + 200)
+    kept: list[str] = []
+    total = 0
+    for line in reversed(rendered):          # keep newest turns first
+        if kept and total + len(line) > budget:
+            break
+        kept.append(line)
+        total += len(line)
+    kept.reverse()
+    body = "\n\n".join(kept)
+    if system:
+        return f"System: {system}\n\n{body}"
+    return body
+
+
+def last_user_attachment_kind(messages: list[ChatMessage]) -> str | None:
+    """Return the non-text input type in the latest user message (image_url/file/…), else None."""
+    for m in reversed(messages):
+        if m.role == "user":
+            if isinstance(m.content, list):
+                for item in m.content:
+                    if isinstance(item, dict):
+                        t = item.get("type")
+                        if t and t != "text":
+                            return str(t)
+            return None
+    return None
+
+
 def is_meta_request(messages: list[ChatMessage]) -> bool:
     for message in messages:
         content = content_to_text(message.content)
