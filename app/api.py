@@ -29,6 +29,7 @@ from app.openai_models import (
     is_meta_request,
     normalize_stop_sequences,
     prompt_from_completion_request,
+    prompt_to_attachment_if_large,
     serialize_messages,
 )
 from app.session_service import BrowserSessionService
@@ -343,6 +344,20 @@ def create_app() -> FastAPI:
     @app.post("/chat/completions")
     async def chat_completions(payload: ChatCompletionRequest, request: Request):
         _require_api_key(request)
+        if os.environ.get("DEBUG_PAYLOAD"):
+            for i, m in enumerate(payload.messages):
+                c = m.content
+                if isinstance(c, str):
+                    log.info("[payload] msg[%d] role=%s str len=%d head=%r tail=%r", i, m.role, len(c), c[:220], c[-120:])
+                elif isinstance(c, list):
+                    kinds = [it.get("type") for it in c if isinstance(it, dict)]
+                    log.info("[payload] msg[%d] role=%s list parts=%s", i, m.role, kinds)
+                    for it in c:
+                        if isinstance(it, dict) and it.get("type") == "text":
+                            t = it.get("text", "")
+                            log.info("[payload]   text len=%d head=%r tail=%r", len(t), t[:220], t[-120:])
+                        elif isinstance(it, dict):
+                            log.info("[payload]   part=%s keys=%s", it.get("type"), list(it.keys()))
         resolved_model = _resolve_model(payload.model)
         if resolved_model is None:
             return _error_response(f"The model '{payload.model}' does not exist.", status_code=404, error_type="invalid_request_error", code="model_not_found")
@@ -362,6 +377,10 @@ def create_app() -> FastAPI:
             return _error_response(str(fe), status_code=400, error_type="invalid_request_error", code=fe.code)
 
         prompt = serialize_messages(payload.messages)
+        if not files:
+            # OpenWebUI (full-context) path: lift a big injected document into a .md upload
+            # instead of typing/truncating it.
+            prompt, files = prompt_to_attachment_if_large(prompt)
         if not prompt and not files:
             return _error_response("No user message provided.")
 

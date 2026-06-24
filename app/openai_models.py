@@ -129,6 +129,34 @@ def serialize_messages(messages: list[ChatMessage]) -> str:
     return body
 
 
+# OpenWebUI (Bypass Embedding / Full Context) injects the whole document as ONE user
+# string: "### Task: …<context><source>…doc text…</source></context>\n\n<the real query>".
+# Typing tens of thousands of chars is unviable + would truncate, so we lift the document
+# text out into a .md file to upload, and type only the user's actual query.
+_CONTEXT_RE = re.compile(r"<context>(.*?)</context>", re.DOTALL)
+PROMPT_TO_FILE_THRESHOLD = 8000
+
+
+def prompt_to_attachment_if_large(prompt: str, threshold: int = PROMPT_TO_FILE_THRESHOLD):
+    """Return (typed_prompt, [(filename, mime, bytes)]).
+
+    If the prompt embeds a large <context>…</context> block, move that document text to a
+    .md attachment and reduce the typed prompt to the user's trailing query. Otherwise the
+    prompt is returned unchanged with no files."""
+    if not prompt or len(prompt) < threshold:
+        return prompt, []
+    m = _CONTEXT_RE.search(prompt)
+    if not m:
+        return prompt, []
+    doc = re.sub(r"</?source[^>]*>", "", m.group(1)).strip()   # keep source text, drop tags
+    if len(doc) < 500:
+        return prompt, []
+    query = prompt[m.end():].strip()                            # the real question follows </context>
+    if not query:
+        query = "Utilise le(s) document(s) joint(s) pour répondre."
+    return query, [("document.md", "text/markdown", doc.encode("utf-8"))]
+
+
 def last_user_attachment_kind(messages: list[ChatMessage]) -> str | None:
     """Return the non-text input type in the latest user message (image_url/file/…), else None."""
     for m in reversed(messages):
@@ -253,27 +281,29 @@ def extract_file_attachments(messages: list[ChatMessage]) -> list[tuple[str, str
 
 
 def is_meta_request(messages: list[ChatMessage]) -> bool:
+    """True only for OpenWebUI background tasks (title / follow-ups / tags) we can answer
+    with a canned reply instead of a ChatGPT turn.
+
+    IMPORTANT: OpenWebUI's RAG / full-context document-answer prompt ALSO begins with
+    "### Task:\nRespond to the user query using the provided context" — that is a REAL
+    question and must NOT be short-circuited. So we never treat a message carrying a
+    <context> block (or that explicit answer instruction) as meta, and we match only the
+    distinctive background-task verbs, not generic "### task:" headers.
+    """
+    _BG_TASKS = (
+        "generate a concise", "3-5 word title", "concise, 3-5 word",
+        "follow-up question", "suggest 3-5", "summarizing the chat",
+        "json object with a", "follow_ups", "broad tags categorizing",
+        "generate 1-3 broad tags",
+    )
     for message in messages:
         content = content_to_text(message.content)
         if not content:
             continue
         lower = content.lower()
-        if message.role == "system" and any(
-            keyword in lower
-            for keyword in (
-                "generate a concise",
-                "3-5 word title",
-                "follow-up question",
-                "suggest 3-5",
-                "summarizing the chat",
-                "json object with a",
-                "follow_ups",
-            )
-        ):
-            return True
-        if message.role == "user" and any(
-            keyword in lower for keyword in ("### task:", "### guidelines", "suggest 3-5 relevant")
-        ):
+        if "<context>" in lower or "respond to the user query using the provided context" in lower:
+            return False   # a real (document-grounded) answer request
+        if any(keyword in lower for keyword in _BG_TASKS):
             return True
     return False
 
