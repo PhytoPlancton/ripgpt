@@ -57,6 +57,10 @@ MODELS: dict[str, dict] = {
     "o3":               {"slug": "o3",               "temporary": True},
     # persistent (saved-history) option, uses whatever model ChatGPT has selected
     "chatgpt":          {"slug": None, "temporary": False},
+    # image generation: ChatGPT disables it in temporary chats, so this one is
+    # persistent. The image backend (GPT Image) is shared across chat models; we
+    # pin GPT-5.5 as the orchestrator so the image tool is reliably available.
+    "gpt-image":        {"slug": "gpt-5-5", "temporary": False, "image": True},
 }
 
 # "auto" routing: a complex/technical ask → reasoning model; otherwise a fast one.
@@ -95,11 +99,11 @@ def _resolve_model(model: str) -> str | None:
     return model if model in MODELS else None
 
 
-def _model_config(model: str, prompt: str) -> tuple[bool, str | None]:
-    """Return (temporary, slug) for a resolved model name, resolving 'auto' from the prompt."""
+def _model_config(model: str, prompt: str) -> tuple[bool, str | None, bool]:
+    """Return (temporary, slug, image) for a resolved model, resolving 'auto' from the prompt."""
     cfg = MODELS[model]
     slug = _auto_pick_slug(prompt) if cfg.get("auto") else cfg.get("slug")
-    return cfg["temporary"], slug
+    return cfg["temporary"], slug, bool(cfg.get("image"))
 
 
 def _count_tokens(text: str) -> int:
@@ -261,7 +265,7 @@ def create_app() -> FastAPI:
         if not prompt:
             return _error_response("No user message provided.")
 
-        temporary, slug = _model_config(resolved_model, prompt)
+        temporary, slug, image = _model_config(resolved_model, prompt)
 
         if SERVICE.is_paused():
             return _error_response("Proxy is paused.", status_code=503, error_type="server_error", code="paused")
@@ -275,6 +279,7 @@ def create_app() -> FastAPI:
                     model=resolved_model,
                     temporary=temporary,
                     model_slug=slug,
+                    image=image,
                     stop=payload.stop,
                     include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
                 ),
@@ -284,7 +289,7 @@ def create_app() -> FastAPI:
 
         t0 = time.time()
         try:
-            answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug)
+            answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug, image=image)
         except Exception as exc:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
@@ -314,7 +319,7 @@ def create_app() -> FastAPI:
 
         completion_id = f"cmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
-        temporary, slug = _model_config(resolved_model, prompt)
+        temporary, slug, image = _model_config(resolved_model, prompt)
 
         if SERVICE.is_paused():
             return _error_response("Proxy is paused.", status_code=503, error_type="server_error", code="paused")
@@ -328,6 +333,7 @@ def create_app() -> FastAPI:
                     model=resolved_model,
                     temporary=temporary,
                     model_slug=slug,
+                    image=image,
                     stop=payload.stop,
                 ),
                 media_type="text/event-stream",
@@ -336,7 +342,7 @@ def create_app() -> FastAPI:
 
         t0 = time.time()
         try:
-            answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug)
+            answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug, image=image)
         except Exception as exc:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
@@ -397,6 +403,7 @@ async def _stream_chat_completion(
     model: str,
     temporary: bool,
     model_slug: str | None,
+    image: bool,
     stop: str | list[str] | None,
     include_usage: bool,
 ):
@@ -414,7 +421,7 @@ async def _stream_chat_completion(
 
     t0 = time.time()
     try:
-        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug)
+        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image)
     except Exception as exc:
         METRICS.record(model_req=model, model_res=model_slug, status="error",
                        error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
@@ -474,11 +481,12 @@ async def _stream_completion(
     model: str,
     temporary: bool,
     model_slug: str | None,
+    image: bool,
     stop: str | list[str] | None,
 ):
     t0 = time.time()
     try:
-        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug)
+        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image)
     except Exception as exc:
         METRICS.record(model_req=model, model_res=model_slug, status="error",
                        error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))

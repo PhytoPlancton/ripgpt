@@ -626,13 +626,131 @@ def _ensure_composer(page, timeout=30000):
     page.locator("#prompt-textarea").wait_for(state="visible", timeout=15000)
 
 
-def _wait_for_answer(page):
+def _extract_images_from_dom(page):
+    """Pull generated image(s) from the last assistant turn as markdown.
+
+    ChatGPT renders an image-generation result as an <img> whose src is a signed
+    oaiusercontent URL or a blob: URL — neither is captured by the text/v1 stream.
+    We fetch the bytes in-page (we hold the session cookies) and inline them as a
+    base64 data URL so any OpenAI-compatible client renders them; if the fetch is
+    blocked (CORS), we fall back to the raw URL (works while the signature is valid).
+    """
+    try:
+        urls = page.evaluate(r"""async () => {
+            // Scan the whole conversation area, not just a standard assistant message:
+            // ChatGPT's image-preference A/B widget ("Which image do you like more?")
+            // renders the generated images OUTSIDE [data-message-author-role=assistant].
+            const root = document.querySelector('main') || document.body;
+            const cands = [];
+            const seen = new Set();
+            for (const im of Array.from(root.querySelectorAll('img'))) {
+                const src = im.currentSrc || im.getAttribute('src') || '';
+                if (!src || seen.has(src)) continue;
+                const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+                const looks = /oaiusercontent|sdmnt|dalle/i.test(src) || src.startsWith('blob:') || (w >= 256 && h >= 256);
+                const tiny = (w && w < 128) || (h && h < 128);     // skip avatars / UI icons
+                if (!looks || tiny) continue;
+                seen.add(src);
+                cands.push({ src, area: (w * h) || 0 });
+            }
+            cands.sort((a, b) => b.area - a.area);   // biggest (the generated image) first
+            const toData = async (src) => {
+                if (src.startsWith('data:')) return src;
+                try {
+                    const r = await fetch(src, { credentials: 'include' });
+                    if (r.ok) {
+                        const b = await r.blob();
+                        return await new Promise((res, rej) => {
+                            const fr = new FileReader();
+                            fr.onload = () => res(fr.result); fr.onerror = rej;
+                            fr.readAsDataURL(b);
+                        });
+                    }
+                } catch (e) { /* CORS — fall back to raw url */ }
+                return src;
+            };
+            const out = [];
+            for (const c of cands.slice(0, 1)) out.push(await toData(c.src));  // primary image
+            return out;
+        }""")
+        return urls or []
+    except Exception as e:
+        _log(f"[image] extraction failed: {e}")
+        return []
+
+
+def _extract_images_from_stream(page, raw):
+    """Fallback: resolve the image straight from the v1 stream's asset pointer.
+
+    Image-gen turns carry an ``image_asset_pointer`` (file id) in the stream even when
+    the DOM <img> is slow/absent. We resolve it via the backend file-download endpoint
+    (cookies in-page) and inline the bytes as a data URL.
+    """
+    file_ids = []
+    for fid in re.findall(r'file[-_][A-Za-z0-9]{8,}', raw):
+        if fid not in file_ids:
+            file_ids.append(fid)
+    if not file_ids:
+        return []
+    _log(f"[image] stream file id(s): {file_ids[:6]}")
+    out = []
+    for fid in file_ids[:6]:
+        try:
+            data = page.evaluate(r"""async (fid) => {
+                try {
+                    const r = await fetch(`/backend-api/files/${fid}/download`, {credentials:'include', headers:{'Accept':'application/json'}});
+                    if (!r.ok) return 'HTTP '+r.status;
+                    const j = await r.json();
+                    const url = j.download_url || (j.download_urls && j.download_urls[0]);
+                    if (!url) return 'no-url';
+                    const ir = await fetch(url);
+                    if (!ir.ok) return 'dl '+ir.status;
+                    const ct = ir.headers.get('content-type') || '';
+                    if (!/image\//.test(ct)) return 'ct:'+ct;
+                    const b = await ir.blob();
+                    return await new Promise((res, rej) => {
+                        const fr = new FileReader();
+                        fr.onload = () => res(fr.result); fr.onerror = rej;
+                        fr.readAsDataURL(b);
+                    });
+                } catch (e) { return 'ERR:'+e; }
+            }""", fid)
+            if isinstance(data, str) and data.startswith("data:image"):
+                out.append(data)
+            else:
+                _log(f"[image] file {fid}: {str(data)[:60]}")
+        except Exception as e:
+            _log(f"[image] stream file {fid} failed: {e}")
+    return out
+
+
+def _log_image_debug(page, raw):
+    """One-shot diagnostics when no image is captured (selectors / pointers / dom)."""
+    try:
+        ptrs = re.findall(r'"(?:asset_pointer|content_type)":\s*"([^"]+)"', raw)
+        _log(f"[image][debug] pointers/content_types: {ptrs[:12]}")
+        info = page.evaluate(r"""() => {
+            const root = document.querySelector('main') || document.body;
+            const allImgs = Array.from(root.querySelectorAll('img')).map(i => ({src:(i.currentSrc||i.src||'').slice(0,70), w:i.naturalWidth, h:i.naturalHeight}));
+            const msgs = document.querySelectorAll('[data-message-author-role="assistant"]').length;
+            return {url: location.pathname, assistant_msgs: msgs, main_imgs: allImgs};
+        }""")
+        _log(f"[image][debug] dom: {info}")
+    except Exception as e:
+        _log(f"[image][debug] failed: {e}")
+
+
+def _wait_for_answer(page, image=False):
     """Wait until the turn truly completes, then return the answer.
 
     Completion is signalled by window.__answer_done — set by the WebSocket interceptor
     on conversation-turn-complete / message_stream_complete (and by the fetch hook in
     legacy/anon direct-SSE mode). A DOM-stability check is the transport-independent
     safety net if OpenAI changes those markers again.
+
+    When ``image`` is set we additionally wait for the generated <img> to render and
+    append it (as a data URL / link) to the answer — image gen output never appears in
+    the text stream.
     """
     deadline = time.time() + ANSWER_TIMEOUT
     last_dom = ""
@@ -689,6 +807,24 @@ def _wait_for_answer(page):
         answer = dom_answer
     elif not answer:
         _log("[*] DOM answer empty and stream parse empty.")
+
+    if image:
+        # The image can lag the text/completion signal — poll for it to render.
+        img_deadline = time.time() + 90
+        imgs = _extract_images_from_dom(page)
+        while not imgs and time.time() < img_deadline:
+            time.sleep(1.5)
+            imgs = _extract_images_from_dom(page)
+        if not imgs:
+            # DOM empty/slow — resolve straight from the stream's asset pointer.
+            imgs = _extract_images_from_stream(page, raw)
+        if imgs:
+            md = "\n\n".join(f"![image]({u})" for u in imgs)
+            answer = (answer + "\n\n" + md).strip() if answer else md
+            _log(f"[image] captured {len(imgs)} image(s).")
+        else:
+            _log("[image] no image found in the assistant turn.")
+            _log_image_debug(page, raw)
 
     return answer
 
@@ -768,7 +904,7 @@ class ChatSession:
         # field (see INTERCEPT_JS). None/empty = no override (ChatGPT's selected model).
         self._page.evaluate("(s) => { window.__ripgpt_model = s || null; }", model_slug or None)
 
-    def ask(self, question, model_slug=None):
+    def ask(self, question, model_slug=None, image=False):
         # Re-inject interceptors in case page JS replaced window.fetch / WebSocket
         self._page.evaluate(FETCH_INTERCEPT_JS)
         self._page.evaluate(RESET_SSE_JS)
@@ -778,9 +914,9 @@ class ChatSession:
         self._page.keyboard.type(question, delay=20)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")
-        return _wait_for_answer(self._page)
+        return _wait_for_answer(self._page, image=image)
 
-    def send(self, question, model_slug=None):
+    def send(self, question, model_slug=None, image=False):
         """Type and send a question without waiting for the answer."""
         self._page.evaluate(FETCH_INTERCEPT_JS)
         self._page.evaluate(RESET_SSE_JS)

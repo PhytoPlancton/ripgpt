@@ -26,6 +26,7 @@ class SessionRequest:
     done_event: threading.Event
     stream: bool = False
     model_slug: str | None = None
+    image: bool = False          # image-generation turn (capture the rendered <img>)
     control: str | None = None   # e.g. "restart" — handled by the worker, not a chat turn
 
 
@@ -123,11 +124,11 @@ class BrowserSessionService:
         self._start_new_chat(temporary=request.temporary)
         if request.stream:
             assert isinstance(request.holder, queue.Queue)
-            self._session.send(request.prompt, request.model_slug)
+            self._session.send(request.prompt, request.model_slug, image=request.image)
             self._stream_answer_via_dom(self._session._page, request.holder)
         else:
             assert isinstance(request.holder, dict)
-            request.holder["answer"] = self._session.ask(request.prompt, request.model_slug)
+            request.holder["answer"] = self._session.ask(request.prompt, request.model_slug, image=request.image)
 
     def _put_error(self, request: "SessionRequest", exc: Exception) -> None:
         if request.stream:
@@ -146,23 +147,23 @@ class BrowserSessionService:
         self._worker = None
         self._ready.clear()
 
-    def ask(self, prompt: str, temporary: bool = False, model_slug: str | None = None, timeout: float = 330) -> str:
+    def ask(self, prompt: str, temporary: bool = False, model_slug: str | None = None, image: bool = False, timeout: float = 330) -> str:
         self._ensure_ready()
         result: dict[str, str] = {}
         done_event = threading.Event()
-        self._request_queue.put(SessionRequest(prompt=prompt, temporary=temporary, holder=result, done_event=done_event, model_slug=model_slug))
+        self._request_queue.put(SessionRequest(prompt=prompt, temporary=temporary, holder=result, done_event=done_event, model_slug=model_slug, image=image))
         if not done_event.wait(timeout):
             raise TimeoutError("Browser session timed out waiting for a response.")
         if "error" in result:
             raise RuntimeError(result["error"])
         return result.get("answer", "")
 
-    def stream(self, prompt: str, temporary: bool = False, model_slug: str | None = None) -> queue.Queue:
+    def stream(self, prompt: str, temporary: bool = False, model_slug: str | None = None, image: bool = False) -> queue.Queue:
         self._ensure_ready()
         chunk_queue: queue.Queue = queue.Queue()
         done_event = threading.Event()
         self._request_queue.put(
-            SessionRequest(prompt=prompt, temporary=temporary, holder=chunk_queue, done_event=done_event, stream=True, model_slug=model_slug)
+            SessionRequest(prompt=prompt, temporary=temporary, holder=chunk_queue, done_event=done_event, stream=True, model_slug=model_slug, image=image)
         )
         return chunk_queue
 
