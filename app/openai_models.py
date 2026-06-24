@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import re
 import urllib.parse
 from typing import Any, Literal
@@ -232,52 +233,66 @@ def extract_file_attachments(messages: list[ChatMessage]) -> list[tuple[str, str
     Returns a list of (filename, mime, data). Raises FileInputError on malformed,
     unsupported-type, oversized, too-many, or remote-URL inputs (v1 can't fetch URLs).
     """
-    target = None
-    for m in reversed(messages):
-        if m.role == "user":
-            target = m
-            break
-    if target is None or not isinstance(target.content, list):
+    user_msgs = [m for m in messages if m.role == "user" and isinstance(m.content, list)]
+    if not user_msgs:
         return []
 
-    # Count attachment parts BEFORE decoding any — reject over-count as admission control.
-    parts = [it for it in target.content
-             if isinstance(it, dict) and it.get("type") in ("file", "image_url")]
-    if not parts:
-        return []
-    if len(parts) > MAX_FILES:
-        raise FileInputError(f"Too many files ({len(parts)}). Maximum is {MAX_FILES} per message.", code="too_many_files")
+    # Admission control: a single message can't exceed MAX_FILES on its own.
+    latest = [it for it in user_msgs[-1].content
+              if isinstance(it, dict) and it.get("type") in ("file", "image_url")]
+    if len(latest) > MAX_FILES:
+        raise FileInputError(f"Too many files ({len(latest)}). Maximum is {MAX_FILES} per message.", code="too_many_files")
 
-    files: list[tuple[str, str, bytes]] = []
+    # Collect attachments from ALL user turns (newest-first), so a follow-up question
+    # re-uploads images/files attached earlier — ripgpt opens a fresh chat per request
+    # and can't replay binary history as text, so we must resend them every turn.
+    collected: list[tuple[str, str, bytes]] = []
+    seen: set[bytes] = set()
     total = 0
-    for item in parts:
-        if item.get("type") == "file":
-            f = item.get("file") or {}
-            data_url = f.get("file_data") or ""
-            filename = f.get("filename") or "document"
-            if not data_url.startswith("data:"):
-                raise FileInputError("File inputs must be inline base64 data URLs (file_data); the Files API is not supported yet.", code="unsupported_file")
-            decoded = _decode_data_url(data_url, max_bytes=MAX_FILE_BYTES)  # size-checked pre-decode
-        else:  # image_url
-            url = (item.get("image_url") or {}).get("url", "")
-            if not url.startswith("data:"):
-                raise FileInputError("Remote image URLs are not supported yet — send the image as a base64 data URL.", code="unsupported_file")
-            decoded = _decode_data_url(url, max_bytes=MAX_FILE_BYTES)
-            filename = None
-        if not decoded:
-            raise FileInputError("Could not decode file/image data URL.", code="invalid_file")
-        mime, data = decoded
-        if mime not in SUPPORTED_UPLOAD_MIME:
-            raise FileInputError(f"Unsupported file type '{mime}'.", code="unsupported_file_type")
-        total += len(data)
-        if total > MAX_TOTAL_UPLOAD_BYTES:
-            raise FileInputError(f"Total upload exceeds the {MAX_TOTAL_UPLOAD_BYTES//1024//1024} MB limit.", code="payload_too_large")
-        if filename is None:
-            filename = f"image.{_ext_for_upload(mime, '')}"
-        elif "." not in filename:
-            filename = f"{filename}.{_ext_for_upload(mime, filename)}"
-        files.append((filename, mime, data))
-    return files
+    for m in reversed(user_msgs):
+        parts = [it for it in m.content
+                 if isinstance(it, dict) and it.get("type") in ("file", "image_url")]
+        for item in parts:
+            filename, mime, data = _decode_attachment_part(item)
+            if mime not in SUPPORTED_UPLOAD_MIME:
+                raise FileInputError(f"Unsupported file type '{mime}'.", code="unsupported_file_type")
+            h = hashlib.md5(data).digest()
+            if h in seen:                       # same image resent across turns — once is enough
+                continue
+            if len(collected) >= MAX_FILES or total + len(data) > MAX_TOTAL_UPLOAD_BYTES:
+                break
+            seen.add(h)
+            total += len(data)
+            collected.append((filename, mime, data))
+        if len(collected) >= MAX_FILES:
+            break
+    collected.reverse()                          # restore chronological order
+    return collected
+
+
+def _decode_attachment_part(item: dict) -> tuple[str, str, bytes]:
+    """Decode one file/image_url content part → (filename, mime, bytes). Raises on bad input."""
+    if item.get("type") == "file":
+        f = item.get("file") or {}
+        data_url = f.get("file_data") or ""
+        filename = f.get("filename") or "document"
+        if not data_url.startswith("data:"):
+            raise FileInputError("File inputs must be inline base64 data URLs (file_data); the Files API is not supported yet.", code="unsupported_file")
+        decoded = _decode_data_url(data_url, max_bytes=MAX_FILE_BYTES)
+    else:  # image_url
+        url = (item.get("image_url") or {}).get("url", "")
+        if not url.startswith("data:"):
+            raise FileInputError("Remote image URLs are not supported yet — send the image as a base64 data URL.", code="unsupported_file")
+        decoded = _decode_data_url(url, max_bytes=MAX_FILE_BYTES)
+        filename = None
+    if not decoded:
+        raise FileInputError("Could not decode file/image data URL.", code="invalid_file")
+    mime, data = decoded
+    if filename is None:
+        filename = f"image.{_ext_for_upload(mime, '')}"
+    elif "." not in filename:
+        filename = f"{filename}.{_ext_for_upload(mime, filename)}"
+    return filename, mime, data
 
 
 def is_meta_request(messages: list[ChatMessage]) -> bool:
