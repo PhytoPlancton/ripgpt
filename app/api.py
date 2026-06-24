@@ -567,7 +567,63 @@ async def _stream_chat_completion(
     }
     yield f"data: {json.dumps(first_chunk)}\n\n"
 
+    def _delta(content: str) -> str:
+        return "data: " + json.dumps({
+            "id": completion_id, "object": "chat.completion.chunk", "created": created,
+            "model": model, "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
+        }) + "\n\n"
+
+    def _tail(answer_text: str):
+        out = [
+            "data: " + json.dumps({
+                "id": completion_id, "object": "chat.completion.chunk", "created": created,
+                "model": model, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }) + "\n\n"
+        ]
+        if include_usage:
+            out.append("data: " + json.dumps({
+                "id": completion_id, "object": "chat.completion.chunk", "created": created,
+                "model": model, "choices": [], "usage": _make_usage(prompt, answer_text),
+            }) + "\n\n")
+        out.append("data: [DONE]\n\n")
+        return out
+
     t0 = time.time()
+
+    # Plain text turns stream LIVE from the DOM as ChatGPT types (real time-to-first-token).
+    # Image/file turns can't token-stream (the image is appended only at the end), so they
+    # take the robust full-capture path below.
+    if not image and not files:
+        try:
+            chunk_queue = await asyncio.to_thread(SERVICE.stream, prompt, temporary, model_slug)
+        except Exception as exc:
+            METRICS.record(model_req=model, model_res=model_slug, status="error",
+                           error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
+            yield _delta(f"[Error: {exc}]")
+            yield "data: [DONE]\n\n"
+            return
+        parts: list[str] = []
+        while True:
+            item = await asyncio.to_thread(chunk_queue.get)
+            if item is None:
+                break
+            if isinstance(item, dict) and item.get("error"):
+                METRICS.record(model_req=model, model_res=model_slug, status="error",
+                               error_class=classify_error(str(item["error"])), latency_ms=int((time.time() - t0) * 1000))
+                yield _delta(f"[Error: {item['error']}]")
+                yield "data: [DONE]\n\n"
+                return
+            parts.append(item)
+            yield _delta(item)
+        answer = "".join(parts)
+        _ok = bool(answer.strip())
+        METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
+                       error_class=None if _ok else "empty_reply", latency_ms=int((time.time() - t0) * 1000),
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
+        for frame in _tail(answer):
+            yield frame
+        return
+
     try:
         answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image, files)
     except Exception as exc:
