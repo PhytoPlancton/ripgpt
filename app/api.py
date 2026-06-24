@@ -148,16 +148,20 @@ def _sniff_image_mime(raw: bytes) -> str | None:
     return None
 
 
-def _externalize_images(answer: str, base_url: str) -> str:
+def _externalize_images(answer: str, base_url: str) -> tuple[str, int]:
     """Replace inline base64 image data URLs with short ripgpt-hosted URLs.
 
     Multi-MB data URLs render as raw text in OpenWebUI; a short URL renders as an image.
     Only real raster images are hosted; everything else is left inline (see _sniff).
+    Returns (rewritten_answer, n_images_hosted).
     """
     if not answer or "data:image" not in answer:
-        return answer
+        return answer, 0
+
+    count = 0
 
     def repl(m: "re.Match") -> str:
+        nonlocal count
         try:
             raw = base64.b64decode(re.sub(r"\s+", "", m.group(2)))
         except Exception:
@@ -166,9 +170,10 @@ def _externalize_images(answer: str, base_url: str) -> str:
         if not sniffed:
             return m.group(0)   # not a genuine raster image — leave inline, never host
         iid = IMAGES.put(raw, sniffed)   # trust the sniffed type, not the claimed mime
+        count += 1
         return f"{base_url}/images/{iid}.{ext_for(sniffed)}"
 
-    return _DATA_URL_RE.sub(repl, answer)
+    return _DATA_URL_RE.sub(repl, answer), count
 
 
 def _make_usage(prompt: str, content: str) -> dict[str, int]:
@@ -358,12 +363,12 @@ def create_app() -> FastAPI:
             return _error_response(str(exc), status_code=500, error_type="server_error")
 
         latency_ms = int((time.time() - t0) * 1000)
-        answer = _externalize_images(answer, _base_url(request))
+        answer, n_img = _externalize_images(answer, _base_url(request))
         answer = apply_stop_sequences(answer, payload.stop)
         ok = bool(answer.strip())
         METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
                        error_class=None if ok else "empty_reply", latency_ms=latency_ms,
-                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img)
         return _make_chat_completion_response(completion_id, created, resolved_model, answer, prompt)
 
     @app.post("/v1/completions")
@@ -413,12 +418,12 @@ def create_app() -> FastAPI:
             return _error_response(str(exc), status_code=500, error_type="server_error")
 
         latency_ms = int((time.time() - t0) * 1000)
-        answer = _externalize_images(answer, _base_url(request))
+        answer, n_img = _externalize_images(answer, _base_url(request))
         answer = apply_stop_sequences(answer, payload.stop)
         ok = bool(answer.strip())
         METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
                        error_class=None if ok else "empty_reply", latency_ms=latency_ms,
-                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img)
         return _make_completion_response(completion_id, created, resolved_model, answer, prompt)
 
     @app.get("/health")
@@ -520,12 +525,12 @@ async def _stream_chat_completion(
         yield "data: [DONE]\n\n"
         return
 
-    answer = _externalize_images(answer, base_url)
+    answer, n_img = _externalize_images(answer, base_url)
     answer = apply_stop_sequences(answer, stop)
     _ok = bool(answer.strip())
     METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
                    error_class=None if _ok else "empty_reply", latency_ms=int((time.time() - t0) * 1000),
-                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
+                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img)
     for piece in _chunk_text(answer):
         chunk = {
             "id": completion_id,
@@ -587,12 +592,12 @@ async def _stream_completion(
         yield "data: [DONE]\n\n"
         return
 
-    answer = _externalize_images(answer, base_url)
+    answer, n_img = _externalize_images(answer, base_url)
     answer = apply_stop_sequences(answer, stop)
     _ok = bool(answer.strip())
     METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
                    error_class=None if _ok else "empty_reply", latency_ms=int((time.time() - t0) * 1000),
-                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
+                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img)
     for piece in _iter_markdown_chunks(answer):
         chunk = {
             "id": completion_id,

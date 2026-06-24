@@ -51,7 +51,7 @@ class Metrics:
 
     def record(self, *, model_req: str, model_res: str | None, status: str,
                error_class: str | None, latency_ms: int,
-               ptoks: int = 0, ctoks: int = 0) -> None:
+               ptoks: int = 0, ctoks: int = 0, images: int = 0) -> None:
         now = time.time()
         mres = model_res or model_req
         rec = {
@@ -63,16 +63,18 @@ class Metrics:
             "latency_ms": int(latency_ms),
             "ptoks_est": int(ptoks),
             "ctoks_est": int(ctoks),
+            "images": int(images),                  # generated images in this response
         }
         with self._lock:
             self._recent.append(rec)
             lt = self._lifetime.setdefault(
                 mres, {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
-                       "last_ts": None, "lat_sum": 0, "lat_n": 0})
+                       "images": 0, "last_ts": None, "lat_sum": 0, "lat_n": 0})
             lt["req"] += 1
             lt["last_ts"] = now
             lt["ptoks"] += int(ptoks)
             lt["ctoks"] += int(ctoks)
+            lt["images"] += int(images)
             if status == "ok":
                 lt["ok"] += 1
                 lt["lat_sum"] += int(latency_ms)
@@ -130,6 +132,7 @@ class Metrics:
                 "success_rate": round(d["ok"] / req, 4) if req else 0.0,
                 "ctoks": d["ctoks"],
                 "ptoks": d["ptoks"],
+                "images": d.get("images", 0),
                 "avg_latency_ms": int(d["lat_sum"] / d["lat_n"]) if d["lat_n"] else 0,
                 "p95_latency_ms": hour_p95.get(m, 0),
                 "last_ts": d["last_ts"],
@@ -140,6 +143,7 @@ class Metrics:
             "ok": sum(d["ok"] for d in lifetime.values()),
             "err": sum(d["err"] for d in lifetime.values()),
             "ctoks": sum(d["ctoks"] for d in lifetime.values()),
+            "images": sum(d.get("images", 0) for d in lifetime.values()),
             "models": len(lifetime),
             "since": started,
         }

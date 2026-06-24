@@ -125,7 +125,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <h3>Recent requests</h3>
     <div class="tbl-wrap">
       <table>
-        <thead><tr><th>when</th><th>model</th><th>status</th><th>latency</th><th>~tokens</th></tr></thead>
+        <thead><tr><th>when</th><th>model</th><th>status</th><th>latency</th><th>output</th></tr></thead>
         <tbody id="recentBody"><tr><td colspan="5" class="muted">waiting for data…</td></tr></tbody>
       </table>
     </div>
@@ -212,7 +212,7 @@ function fmtN(n){ if(n>=1e6) return (n/1e6).toFixed(1)+'M'; if(n>=1000) return (
 function drawUsage(s){
   const lt=s.lifetime||{requests:0,models:0,ctoks:0};
   $('usageTotals').textContent = lt.requests
-    ? '· '+lt.requests+' requests · '+lt.models+' models · ~'+fmtN(lt.ctoks||0)+' tokens out'
+    ? '· '+lt.requests+' requests · '+lt.models+' models'+(lt.images?' · '+lt.images+' images':'')+' · ~'+fmtN(lt.ctoks||0)+' tokens out'
     : '';
   const arr=s.by_model_usage||[];
   if(!arr.length){ $('usageGrid').innerHTML='<div class="muted">no requests yet</div>'; return; }
@@ -232,7 +232,7 @@ function drawUsage(s){
         <span><b class="ok">${m.ok}</b> ok</span>
         <span><b style="color:${m.err?'var(--red)':'var(--muted)'}">${m.err}</b> err</span>
         <span>p95 <b>${p95}</b></span>
-        <span>out <b>${tok}</b></span>
+        ${m.images?('<span><b class="ok">🖼 '+m.images+'</b> img</span>'):('<span>out <b>'+tok+'</b></span>')}
         <span>last <b>${rel(m.last_ts)}</b></span>
       </div>
     </div>`;
@@ -254,7 +254,7 @@ function drawRecent(recent){
     const lat = (r.latency_ms/1000).toFixed(1)+'s';
     return `<tr><td class=muted>${rel(r.ts)}</td><td>${mr}</td><td>${statusCell(r)}</td>
       <td style="color:${slow?'var(--amber)':'var(--text)'}">${r.status==='ok'?lat:'—'}</td>
-      <td class=muted>${r.status==='ok'?('~'+(r.ptoks_est+r.ctoks_est)):'—'}</td></tr>`;
+      <td class=muted>${r.status!=='ok'?'—':(r.images?('🖼 '+r.images):('~'+(r.ptoks_est+r.ctoks_est)))}</td></tr>`;
   }).join('');
 }
 
