@@ -631,34 +631,47 @@ def _ensure_composer(page, timeout=30000):
     page.locator("#prompt-textarea").wait_for(state="visible", timeout=15000)
 
 
-def _extract_images_from_dom(page):
-    """Pull generated image(s) from the last assistant turn as markdown.
-
-    ChatGPT renders an image-generation result as an <img> whose src is a signed
-    oaiusercontent URL or a blob: URL — neither is captured by the text/v1 stream.
-    We fetch the bytes in-page (we hold the session cookies) and inline them as a
-    base64 data URL so any OpenAI-compatible client renders them; if the fetch is
-    blocked (CORS), we fall back to the raw URL (works while the signature is valid).
-    """
+def _list_output_image_srcs(page):
+    """Srcs of generated-looking images that render AFTER the last user message — i.e. in
+    the assistant's reply — largest first. Position (not src diff) separates the produced
+    image from the user's uploaded inputs: input images live in the user bubble, the
+    output renders after it. Robust to ChatGPT re-assigning input src on commit."""
     try:
-        urls = page.evaluate(r"""async () => {
-            // Scan the whole conversation area, not just a standard assistant message:
-            // ChatGPT's image-preference A/B widget ("Which image do you like more?")
-            // renders the generated images OUTSIDE [data-message-author-role=assistant].
+        return page.evaluate(r"""() => {
             const root = document.querySelector('main') || document.body;
-            const cands = [];
-            const seen = new Set();
+            const users = root.querySelectorAll('[data-message-author-role="user"]');
+            const anchor = users.length ? users[users.length - 1] : null;
+            const out = [];
             for (const im of Array.from(root.querySelectorAll('img'))) {
                 const src = im.currentSrc || im.getAttribute('src') || '';
-                if (!src || seen.has(src)) continue;
+                if (!src) continue;
                 const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
                 const looks = /oaiusercontent|sdmnt|dalle/i.test(src) || src.startsWith('blob:') || (w >= 256 && h >= 256);
-                const tiny = (w && w < 128) || (h && h < 128);     // skip avatars / UI icons
+                const tiny = (w && w < 128) || (h && h < 128);
                 if (!looks || tiny) continue;
-                seen.add(src);
-                cands.push({ src, area: (w * h) || 0 });
+                if (anchor) {
+                    const pos = anchor.compareDocumentPosition(im);
+                    const FOLLOWING = 4, CONTAINED_BY = 16;
+                    // keep only images that come AFTER the last user msg and are NOT inside
+                    // it (an input image in the user bubble is "contained", hence excluded).
+                    if (!(pos & FOLLOWING) || (pos & CONTAINED_BY)) continue;
+                }
+                out.push({ src, area: (w * h) || 0 });
             }
-            cands.sort((a, b) => b.area - a.area);   // biggest (the generated image) first
+            out.sort((a, b) => b.area - a.area);
+            return out.map(o => o.src);
+        }""") or []
+    except Exception as e:
+        _log(f"[image] listing output srcs failed: {e}")
+        return []
+
+
+def _fetch_images_as_dataurls(page, srcs):
+    """Fetch each src in-page and inline as a base64 data URL (raw url fallback on CORS)."""
+    if not srcs:
+        return []
+    try:
+        return page.evaluate(r"""async (srcs) => {
             const toData = async (src) => {
                 if (src.startsWith('data:')) return src;
                 try {
@@ -671,17 +684,16 @@ def _extract_images_from_dom(page):
                             fr.readAsDataURL(b);
                         });
                     }
-                } catch (e) { /* CORS — fall back to raw url */ }
+                } catch (e) {}
                 return src;
             };
             const out = [];
-            for (const c of cands.slice(0, 1)) out.push(await toData(c.src));  // primary image
+            for (const s of srcs) out.push(await toData(s));
             return out;
-        }""")
-        return urls or []
+        }""", srcs) or []
     except Exception as e:
-        _log(f"[image] extraction failed: {e}")
-        return []
+        _log(f"[image] fetching data urls failed: {e}")
+        return list(srcs)
 
 
 def _extract_images_from_stream(page, raw):
@@ -745,7 +757,7 @@ def _log_image_debug(page, raw):
         _log(f"[image][debug] failed: {e}")
 
 
-def _wait_for_answer(page, image=False, timeout=None):
+def _wait_for_answer(page, image=False, files=False, timeout=None):
     """Wait until the turn truly completes, then return the answer.
 
     Completion is signalled by window.__answer_done — set by the WebSocket interceptor
@@ -753,14 +765,16 @@ def _wait_for_answer(page, image=False, timeout=None):
     legacy/anon direct-SSE mode). A DOM-stability check is the transport-independent
     safety net if OpenAI changes those markers again.
 
-    When ``image`` is set we additionally wait for the generated <img> to render and
-    append it (as a data URL / link) to the answer — image gen output never appears in
-    the text stream.
+    When ``image`` (image model) or ``files`` (a turn that may edit/generate an image) is
+    set we append produced images to the answer. We snapshot input image srcs BEFORE
+    generation and only keep NEW srcs afterwards, so an uploaded input image is never
+    echoed back as if it were the output.
     """
     deadline = time.time() + (timeout if timeout is not None else ANSWER_TIMEOUT)
     last_dom = ""
     last_change = time.time()
     started = False
+    capture_images = image or files
 
     while time.time() < deadline:
         state = page.evaluate(
@@ -813,22 +827,36 @@ def _wait_for_answer(page, image=False, timeout=None):
     elif not answer:
         _log("[*] DOM answer empty and stream parse empty.")
 
-    if image:
-        # The image can lag the text/completion signal — poll for it to render.
-        img_deadline = time.time() + 90
-        imgs = _extract_images_from_dom(page)
-        while not imgs and time.time() < img_deadline:
+    if capture_images:
+        # Image model: an image is definitely coming → poll long. File turns: if the text
+        # answer is empty it's likely an image gen/edit turn (the image IS the answer) →
+        # poll long; if there's real text it's doc Q&A → quick check only. Only images
+        # positioned after the last user message count, so inputs are never echoed back.
+        if image:
+            poll_s = 90
+        elif not answer.strip():
+            poll_s = 75
+        else:
+            poll_s = 8
+        img_deadline = time.time() + poll_s
+        out_srcs = _list_output_image_srcs(page)
+        while not out_srcs and time.time() < img_deadline:
             time.sleep(1.5)
-            imgs = _extract_images_from_dom(page)
-        if not imgs:
-            # DOM empty/slow — resolve straight from the stream's asset pointer.
-            imgs = _extract_images_from_stream(page, raw)
-        if imgs:
+            out_srcs = _list_output_image_srcs(page)
+        if not out_srcs and image:
+            # Pure image model with an empty DOM — resolve from the stream's asset pointer.
+            stream_imgs = _extract_images_from_stream(page, raw)
+            if stream_imgs:
+                md = "\n\n".join(f"![image]({u})" for u in stream_imgs)
+                answer = (answer + "\n\n" + md).strip() if answer else md
+                _log(f"[image] captured {len(stream_imgs)} image(s) via stream.")
+        if out_srcs:
+            imgs = _fetch_images_as_dataurls(page, out_srcs[:1])   # the largest output image
             md = "\n\n".join(f"![image]({u})" for u in imgs)
             answer = (answer + "\n\n" + md).strip() if answer else md
-            _log(f"[image] captured {len(imgs)} image(s).")
-        else:
-            _log("[image] no image found in the assistant turn.")
+            _log(f"[image] captured {len(imgs)} output image(s).")
+        elif image:
+            _log("[image] no output image found in the assistant turn.")
             _log_image_debug(page, raw)
 
     return answer
@@ -987,7 +1015,7 @@ class ChatSession:
         self._page.keyboard.insert_text(question)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")
-        return _wait_for_answer(self._page, image=image,
+        return _wait_for_answer(self._page, image=image, files=bool(files),
                                 timeout=FILE_ANSWER_TIMEOUT if files else None)
 
     def send(self, question, model_slug=None, image=False, files=None):
