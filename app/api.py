@@ -22,10 +22,11 @@ from app.openai_models import (
     ChatCompletionRequest,
     CompletionRequest,
     apply_stop_sequences,
+    extract_file_attachments,
     extract_last_user_message,
+    FileInputError,
     generate_meta_response,
     is_meta_request,
-    last_user_attachment_kind,
     normalize_stop_sequences,
     prompt_from_completion_request,
     serialize_messages,
@@ -37,6 +38,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("ripgpt.api")
 
 API_KEY = os.environ.get("API_KEY", "")
+# Hard ceiling on request body size (file uploads are base64, so ~135 MB covers the
+# 100 MB cumulative file cap with overhead). Rejected at the edge before buffering.
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(160 * 1024 * 1024)))
 
 
 def _require_api_key(request: Request) -> None:
@@ -310,6 +314,16 @@ async def _lifespan(_: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="RipGPT API", lifespan=_lifespan)
 
+    @app.middleware("http")
+    async def _limit_body(request: Request, call_next):
+        # Reject oversized bodies up front (before Starlette buffers them) so a huge
+        # file/base64 payload can't OOM the single-worker proxy.
+        cl = request.headers.get("content-length")
+        if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
+            return _error_response("Request body too large.", status_code=413,
+                                   error_type="invalid_request_error", code="payload_too_large")
+        return await call_next(request)
+
     @app.get("/v1/models")
     @app.get("/models")
     async def list_models(request: Request):
@@ -342,18 +356,20 @@ def create_app() -> FastAPI:
             meta_answer = generate_meta_response(payload.messages)
             return _make_chat_completion_response(completion_id, created, resolved_model, meta_answer, "")
 
-        attachment = last_user_attachment_kind(payload.messages)
-        if attachment:
-            return _error_response(
-                f"This model is text-only — '{attachment}' input is not supported yet. "
-                "Remove the attachment and send text.",
-                status_code=400, error_type="invalid_request_error", code="unsupported_input")
+        try:
+            files = extract_file_attachments(payload.messages)
+        except FileInputError as fe:
+            return _error_response(str(fe), status_code=400, error_type="invalid_request_error", code=fe.code)
 
         prompt = serialize_messages(payload.messages)
-        if not prompt:
+        if not prompt and not files:
             return _error_response("No user message provided.")
 
         temporary, slug, image = _model_config(resolved_model, prompt)
+        if files:
+            temporary = False   # attachments are disabled in temporary chats
+            if not prompt:
+                prompt = "Please analyse the attached file(s)."
 
         if SERVICE.is_paused():
             return _error_response("Proxy is paused.", status_code=503, error_type="server_error", code="paused")
@@ -368,6 +384,7 @@ def create_app() -> FastAPI:
                     temporary=temporary,
                     model_slug=slug,
                     image=image,
+                    files=files,
                     base_url=_base_url(request),
                     stop=payload.stop,
                     include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
@@ -378,7 +395,7 @@ def create_app() -> FastAPI:
 
         t0 = time.time()
         try:
-            answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug, image=image)
+            answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug, image=image, files=files)
         except Exception as exc:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
@@ -514,6 +531,7 @@ async def _stream_chat_completion(
     temporary: bool,
     model_slug: str | None,
     image: bool,
+    files: list | None,
     base_url: str,
     stop: str | list[str] | None,
     include_usage: bool,
@@ -532,7 +550,7 @@ async def _stream_chat_completion(
 
     t0 = time.time()
     try:
-        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image)
+        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image, files)
     except Exception as exc:
         METRICS.record(model_req=model, model_res=model_slug, status="error",
                        error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))

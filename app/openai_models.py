@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import re
+import urllib.parse
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -138,6 +141,115 @@ def last_user_attachment_kind(messages: list[ChatMessage]) -> str | None:
                             return str(t)
             return None
     return None
+
+
+# ── File / document upload ────────────────────────────────────────────────────
+# Uploaded files are decoded here and handed (name, mime, bytes) to the browser,
+# which drops them into ChatGPT's composer (page.set_input_files) for native
+# document understanding. Caller validates caps and returns 4xx on violation.
+
+MAX_FILES = 10                              # ChatGPT's per-message ceiling
+MAX_FILE_BYTES = 50 * 1024 * 1024           # 50 MB/file (conservative)
+MAX_TOTAL_UPLOAD_BYTES = 100 * 1024 * 1024  # cumulative cap across all files in one request
+
+# mime -> extension for files ChatGPT accepts (retrieval + vision)
+SUPPORTED_UPLOAD_MIME = {
+    "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/msword": "doc",
+    "text/plain": "txt", "text/markdown": "md", "text/csv": "csv",
+    "application/json": "json", "application/rtf": "rtf", "text/rtf": "rtf",
+    "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif",
+}
+
+
+class FileInputError(ValueError):
+    """Raised for malformed / unsupported / oversized file inputs (→ 400)."""
+    def __init__(self, message: str, code: str = "invalid_file"):
+        super().__init__(message)
+        self.code = code
+
+
+def _decode_data_url(data_url: str, max_bytes: int | None = None) -> tuple[str, bytes] | None:
+    """data:<mime>[;param=...][;base64],<payload>  ->  (mime, bytes). None if not a data URL.
+
+    max_bytes is checked against the ENCODED length first, so an oversized payload is
+    rejected before the decoded buffer is allocated (admission control, not post-hoc)."""
+    m = re.match(r"data:([^;,]*)((?:;[\w.+-]+=[^;,]*)*)(;base64)?,(.*)", data_url or "", re.DOTALL)
+    if not m:
+        return None
+    mime = (m.group(1) or "").strip() or "application/octet-stream"
+    is_b64 = bool(m.group(3))
+    payload = m.group(4)
+    approx = (len(payload) * 3) // 4 if is_b64 else len(payload)
+    if max_bytes is not None and approx > max_bytes:
+        raise FileInputError(f"A file exceeds the {max_bytes // 1024 // 1024} MB limit.", code="file_too_large")
+    try:
+        data = base64.b64decode(payload) if is_b64 else urllib.parse.unquote_to_bytes(payload)
+    except Exception:
+        raise FileInputError("Malformed base64 in file/image data URL.", code="invalid_file")
+    return mime, data
+
+
+def _ext_for_upload(mime: str, filename: str) -> str:
+    if filename and "." in filename:
+        return filename.rsplit(".", 1)[-1].lower()
+    return SUPPORTED_UPLOAD_MIME.get(mime, "bin")
+
+
+def extract_file_attachments(messages: list[ChatMessage]) -> list[tuple[str, str, bytes]]:
+    """Decode file/image attachments from the latest user message.
+
+    Returns a list of (filename, mime, data). Raises FileInputError on malformed,
+    unsupported-type, oversized, too-many, or remote-URL inputs (v1 can't fetch URLs).
+    """
+    target = None
+    for m in reversed(messages):
+        if m.role == "user":
+            target = m
+            break
+    if target is None or not isinstance(target.content, list):
+        return []
+
+    # Count attachment parts BEFORE decoding any — reject over-count as admission control.
+    parts = [it for it in target.content
+             if isinstance(it, dict) and it.get("type") in ("file", "image_url")]
+    if not parts:
+        return []
+    if len(parts) > MAX_FILES:
+        raise FileInputError(f"Too many files ({len(parts)}). Maximum is {MAX_FILES} per message.", code="too_many_files")
+
+    files: list[tuple[str, str, bytes]] = []
+    total = 0
+    for item in parts:
+        if item.get("type") == "file":
+            f = item.get("file") or {}
+            data_url = f.get("file_data") or ""
+            filename = f.get("filename") or "document"
+            if not data_url.startswith("data:"):
+                raise FileInputError("File inputs must be inline base64 data URLs (file_data); the Files API is not supported yet.", code="unsupported_file")
+            decoded = _decode_data_url(data_url, max_bytes=MAX_FILE_BYTES)  # size-checked pre-decode
+        else:  # image_url
+            url = (item.get("image_url") or {}).get("url", "")
+            if not url.startswith("data:"):
+                raise FileInputError("Remote image URLs are not supported yet — send the image as a base64 data URL.", code="unsupported_file")
+            decoded = _decode_data_url(url, max_bytes=MAX_FILE_BYTES)
+            filename = None
+        if not decoded:
+            raise FileInputError("Could not decode file/image data URL.", code="invalid_file")
+        mime, data = decoded
+        if mime not in SUPPORTED_UPLOAD_MIME:
+            raise FileInputError(f"Unsupported file type '{mime}'.", code="unsupported_file_type")
+        total += len(data)
+        if total > MAX_TOTAL_UPLOAD_BYTES:
+            raise FileInputError(f"Total upload exceeds the {MAX_TOTAL_UPLOAD_BYTES//1024//1024} MB limit.", code="payload_too_large")
+        if filename is None:
+            filename = f"image.{_ext_for_upload(mime, '')}"
+        elif "." not in filename:
+            filename = f"{filename}.{_ext_for_upload(mime, filename)}"
+        files.append((filename, mime, data))
+    return files
 
 
 def is_meta_request(messages: list[ChatMessage]) -> bool:

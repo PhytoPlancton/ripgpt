@@ -107,6 +107,11 @@ except ImportError:
 # Max seconds to wait for a single answer. Reasoning models ("…-thinking") can be
 # slow, so this is generous and overridable.
 ANSWER_TIMEOUT = float(os.environ.get("ANSWER_TIMEOUT", "300"))
+# File turns: uploading + ChatGPT ingesting large docs takes much longer than text.
+# Keep (upload + answer) below the service-level FILE_TURN_TIMEOUT so the client wait
+# never expires before the worker finishes.
+FILE_UPLOAD_TIMEOUT = float(os.environ.get("FILE_UPLOAD_TIMEOUT", "180"))   # set→ready gate
+FILE_ANSWER_TIMEOUT = float(os.environ.get("FILE_ANSWER_TIMEOUT", "540"))   # ingest + answer
 # How long the rendered answer must stop changing (while not generating) before we
 # accept it — a transport-independent safety net if OpenAI changes its markers.
 DOM_STABLE_SECS = float(os.environ.get("DOM_STABLE_SECS", "2.5"))
@@ -740,7 +745,7 @@ def _log_image_debug(page, raw):
         _log(f"[image][debug] failed: {e}")
 
 
-def _wait_for_answer(page, image=False):
+def _wait_for_answer(page, image=False, timeout=None):
     """Wait until the turn truly completes, then return the answer.
 
     Completion is signalled by window.__answer_done — set by the WebSocket interceptor
@@ -752,7 +757,7 @@ def _wait_for_answer(page, image=False):
     append it (as a data URL / link) to the answer — image gen output never appears in
     the text stream.
     """
-    deadline = time.time() + ANSWER_TIMEOUT
+    deadline = time.time() + (timeout if timeout is not None else ANSWER_TIMEOUT)
     last_dom = ""
     last_change = time.time()
     started = False
@@ -904,27 +909,97 @@ class ChatSession:
         # field (see INTERCEPT_JS). None/empty = no override (ChatGPT's selected model).
         self._page.evaluate("(s) => { window.__ripgpt_model = s || null; }", model_slug or None)
 
-    def ask(self, question, model_slug=None, image=False):
+    def _upload_files(self, files):
+        """Write files to a temp dir under their real names, drop them into the composer's
+        <input type=file>, and wait until ChatGPT finished processing before returning.
+        Real names are used so the model sees 'report.pdf', not a tempfile name."""
+        import tempfile
+        import shutil
+        tmpdir = tempfile.mkdtemp(prefix="ripgpt_up_")
+        paths = []
+        try:
+            seen = set()
+            for name, mime, data in files:
+                safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "file") or "file"
+                if safe.strip(".") == "":                  # '.', '..', '...' → not a real name
+                    safe = "_" + (safe or "file")
+                safe = safe[:200]                          # cap pathological lengths
+                while safe in seen:                        # avoid collisions in one dir
+                    safe = "_" + safe
+                seen.add(safe)
+                path = os.path.join(tmpdir, safe)
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                paths.append(path)
+            self._page.locator('input[type="file"]').first.set_input_files(paths)
+            _log(f"[file] set {len(paths)} file(s) on the composer; waiting for processing...")
+            self._wait_for_upload(len(paths))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _wait_for_upload(self, n_files):
+        """Block until attachments finish processing, so Enter doesn't send without them.
+
+        Reliable signals (from the live composer DOM): the send button
+        ([data-testid=send-button]) is DISABLED while uploading and enables once the
+        file(s) are ready (file-only send is allowed); each attachment renders a
+        '.file-tile' / 'Remove file N' control. We require both, stable for 2 ticks.
+        """
+        deadline = time.time() + FILE_UPLOAD_TIMEOUT
+        stable = 0
+        last = None
+        while time.time() < deadline:
+            st = self._page.evaluate(r"""() => {
+                const send = document.querySelector('[data-testid="send-button"]');
+                const sendEnabled = !!send && !send.disabled && send.getAttribute('aria-disabled') !== 'true';
+                const tiles = document.querySelectorAll('[class*="file-tile"], form button[aria-label^="Remove file"]').length;
+                return { sendEnabled, tiles };
+            }""")
+            if st != last:
+                _log(f"[file] upload state: {st}")
+                last = st
+            if st.get("tiles", 0) >= n_files and st.get("sendEnabled"):
+                stable += 1
+                if stable >= 2:
+                    _log("[file] attachments ready (send enabled).")
+                    time.sleep(0.3)
+                    return
+            else:
+                stable = 0
+            time.sleep(1.0)
+        # Don't send a prompt about a file the model never received — fail loudly so the
+        # caller gets a clear error (and the turn isn't answered as if a file were present).
+        raise RuntimeError(f"File upload did not complete in {int(FILE_UPLOAD_TIMEOUT)}s "
+                           f"(attachments not ready) — not sending.")
+
+    def ask(self, question, model_slug=None, image=False, files=None):
         # Re-inject interceptors in case page JS replaced window.fetch / WebSocket
         self._page.evaluate(FETCH_INTERCEPT_JS)
         self._page.evaluate(RESET_SSE_JS)
         _ensure_composer(self._page)
         self._apply_model(model_slug)
         _focus_composer(self._page)
+        if files:
+            self._upload_files(files)
+            _focus_composer(self._page)
         # insertText pastes the whole prompt at once; char-by-char typing would take
         # minutes for a folded multi-turn transcript (and is fragile).
         self._page.keyboard.insert_text(question)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")
-        return _wait_for_answer(self._page, image=image)
+        return _wait_for_answer(self._page, image=image,
+                                timeout=FILE_ANSWER_TIMEOUT if files else None)
 
-    def send(self, question, model_slug=None, image=False):
+    def send(self, question, model_slug=None, image=False, files=None):
         """Type and send a question without waiting for the answer."""
         self._page.evaluate(FETCH_INTERCEPT_JS)
         self._page.evaluate(RESET_SSE_JS)
         _ensure_composer(self._page)
         self._apply_model(model_slug)
         _focus_composer(self._page)
+        if files:
+            self._upload_files(files)
+            _focus_composer(self._page)
         self._page.keyboard.insert_text(question)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")

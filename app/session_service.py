@@ -17,6 +17,12 @@ logger = logging.getLogger("ripgpt.session")
 # Defaults to 15 minutes; override via SESSION_CHECK_INTERVAL env var.
 SESSION_CHECK_INTERVAL = int(os.environ.get("SESSION_CHECK_INTERVAL", "900"))
 
+# File turns (upload + ChatGPT ingest of large docs) can take minutes — longer budget.
+# Must exceed browser FILE_UPLOAD_TIMEOUT(180) + FILE_ANSWER_TIMEOUT(540) so the client
+# wait never expires while the worker is still legitimately processing.
+FILE_TURN_TIMEOUT = int(os.environ.get("FILE_TURN_TIMEOUT", "840"))
+DEFAULT_TURN_TIMEOUT = 330
+
 
 @dataclass(slots=True)
 class SessionRequest:
@@ -27,6 +33,7 @@ class SessionRequest:
     stream: bool = False
     model_slug: str | None = None
     image: bool = False          # image-generation turn (capture the rendered <img>)
+    files: list | None = None    # [(filename, mime, bytes)] to upload into the composer
     control: str | None = None   # e.g. "restart" — handled by the worker, not a chat turn
 
 
@@ -124,11 +131,11 @@ class BrowserSessionService:
         self._start_new_chat(temporary=request.temporary)
         if request.stream:
             assert isinstance(request.holder, queue.Queue)
-            self._session.send(request.prompt, request.model_slug, image=request.image)
+            self._session.send(request.prompt, request.model_slug, image=request.image, files=request.files)
             self._stream_answer_via_dom(self._session._page, request.holder)
         else:
             assert isinstance(request.holder, dict)
-            request.holder["answer"] = self._session.ask(request.prompt, request.model_slug, image=request.image)
+            request.holder["answer"] = self._session.ask(request.prompt, request.model_slug, image=request.image, files=request.files)
 
     def _put_error(self, request: "SessionRequest", exc: Exception) -> None:
         if request.stream:
@@ -147,23 +154,25 @@ class BrowserSessionService:
         self._worker = None
         self._ready.clear()
 
-    def ask(self, prompt: str, temporary: bool = False, model_slug: str | None = None, image: bool = False, timeout: float = 330) -> str:
+    def ask(self, prompt: str, temporary: bool = False, model_slug: str | None = None, image: bool = False, files: list | None = None, timeout: float | None = None) -> str:
         self._ensure_ready()
+        if timeout is None:
+            timeout = FILE_TURN_TIMEOUT if files else DEFAULT_TURN_TIMEOUT
         result: dict[str, str] = {}
         done_event = threading.Event()
-        self._request_queue.put(SessionRequest(prompt=prompt, temporary=temporary, holder=result, done_event=done_event, model_slug=model_slug, image=image))
+        self._request_queue.put(SessionRequest(prompt=prompt, temporary=temporary, holder=result, done_event=done_event, model_slug=model_slug, image=image, files=files))
         if not done_event.wait(timeout):
             raise TimeoutError("Browser session timed out waiting for a response.")
         if "error" in result:
             raise RuntimeError(result["error"])
         return result.get("answer", "")
 
-    def stream(self, prompt: str, temporary: bool = False, model_slug: str | None = None, image: bool = False) -> queue.Queue:
+    def stream(self, prompt: str, temporary: bool = False, model_slug: str | None = None, image: bool = False, files: list | None = None) -> queue.Queue:
         self._ensure_ready()
         chunk_queue: queue.Queue = queue.Queue()
         done_event = threading.Event()
         self._request_queue.put(
-            SessionRequest(prompt=prompt, temporary=temporary, holder=chunk_queue, done_event=done_event, stream=True, model_slug=model_slug, image=image)
+            SessionRequest(prompt=prompt, temporary=temporary, holder=chunk_queue, done_event=done_event, stream=True, model_slug=model_slug, image=image, files=files)
         )
         return chunk_queue
 
@@ -230,6 +239,9 @@ class BrowserSessionService:
                 # Self-heal: a wedged composer (timeout waiting for #prompt-textarea) means
                 # the browser is stuck — recreate it and retry the turn once, instead of
                 # requiring a manual `docker compose restart api`.
+                # A composer wedge (#prompt-textarea timeout) is a real stuck-browser
+                # state even on file turns — recover and retry once (re-upload is safe;
+                # legit slow upload/ingest waits don't raise, so they won't false-trip).
                 wedged = ("prompt-textarea" in str(exc)) or ("Timeout" in str(exc)) or ("composer" in str(exc).lower())
                 if wedged:
                     logger.warning("Session wedged (%s) — recreating browser and retrying once.", str(exc)[:80])
