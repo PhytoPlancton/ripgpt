@@ -111,7 +111,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <!-- charts -->
   <div class="grid row2" style="margin-top:12px">
     <div class="card"><h3>Requests over time · ok vs error (1-min)</h3><div class="chartbox"><canvas id="reqChart"></canvas></div></div>
-    <div class="card"><h3>Latency by model · p50 / p95 (ms, last hour)</h3><div class="chartbox"><canvas id="latChart"></canvas></div></div>
+    <div class="card"><h3>Latence par modèle · médiane &amp; 95ᵉ percentile (ms, dernière heure)</h3><div class="chartbox"><canvas id="latChart"></canvas></div></div>
   </div>
 
   <!-- usage by model (Perplexity-style cards) -->
@@ -274,8 +274,8 @@ function drawLat(ml){
   if(!latChart){
     latChart=new Chart($('latChart'),{type:'bar',
       data:{labels,datasets:[
-        {label:'p50',data:ml.map(m=>m.p50),backgroundColor:'#56b6ff'},
-        {label:'p95',data:ml.map(m=>m.p95),backgroundColor:'#b58cff'}]},
+        {label:'médiane (p50)',data:ml.map(m=>m.p50),backgroundColor:'#56b6ff'},
+        {label:'95ᵉ percentile (p95)',data:ml.map(m=>m.p95),backgroundColor:'#b58cff'}]},
       options:Object.assign(chartOpts(),{indexAxis:'y'})});
   } else { latChart.data.labels=labels; latChart.data.datasets[0].data=ml.map(m=>m.p50); latChart.data.datasets[1].data=ml.map(m=>m.p95); latChart.update('none'); }
 }
