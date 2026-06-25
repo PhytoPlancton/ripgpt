@@ -267,20 +267,15 @@ class BrowserSessionService:
     def _start_new_chat(self, temporary: bool = False) -> None:
         assert self._session is not None
         page = self._session._page
-        current = page.url
         target = "https://chatgpt.com/?temporary-chat=true" if temporary else "https://chatgpt.com"
 
-        if not temporary and current.rstrip("/") == "https://chatgpt.com":
-            return
-        if temporary and "temporary-chat=true" in current and "/c/" not in current:
-            return
-
-        try:
-            page.goto(target, wait_until="domcontentloaded", timeout=30_000)
-            page.evaluate(browser.FETCH_INTERCEPT_JS)
-            browser._ensure_composer(page)
-        except Exception as exc:
-            logger.warning("Could not start new chat: %s", exc)
+        # ALWAYS navigate to a fresh chat. We must never reuse a chat: ripgpt replays the
+        # whole conversation in the prompt (serialize_messages) and reads the answer from
+        # the DOM, so a reused chat leaves PRIOR answers in the DOM — a stale read can then
+        # return a previous turn's answer (cross-request leak). A fresh chat = empty DOM.
+        page.goto(target, wait_until="domcontentloaded", timeout=30_000)
+        page.evaluate(browser.FETCH_INTERCEPT_JS)
+        browser._ensure_composer(page)
 
     def _stream_answer_via_dom(self, page, chunk_queue: queue.Queue) -> None:
         sent = ""
