@@ -24,6 +24,12 @@ CHATGPT_SESSION_TOKEN = os.environ.get("CHATGPT_SESSION_TOKEN", "").strip()
 CHATGPT_COOKIES = os.environ.get("CHATGPT_COOKIES", "").strip()
 
 SESSION_COOKIE_NAME = "__Secure-next-auth.session-token"
+
+# Persist the browser profile (cookies + storage) to this dir to keep the ChatGPT session
+# alive across restarts WITHOUT re-pasting a cookie. The env cookie is then a one-time
+# bootstrap: once the profile holds a session, ChatGPT auto-renews it on use. Empty = the
+# old behaviour (fresh context each start, env cookie re-injected every time).
+BROWSER_PROFILE_DIR = os.environ.get("BROWSER_PROFILE_DIR", "").strip()
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -878,13 +884,27 @@ class ChatSession:
 
     def __init__(self):
         self._playwright = sync_playwright().start()
-        browser = self._playwright.firefox.launch(headless=HEADLESS)
-        self._context = browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-        )
-        self._page = self._context.new_page()
+        self._persistent = bool(BROWSER_PROFILE_DIR)
+        if self._persistent:
+            # Persistent context: cookies/storage live in BROWSER_PROFILE_DIR (a volume),
+            # so the session survives restarts and ChatGPT auto-renews its token on use.
+            os.makedirs(BROWSER_PROFILE_DIR, exist_ok=True)
+            self._context = self._playwright.firefox.launch_persistent_context(
+                BROWSER_PROFILE_DIR,
+                headless=HEADLESS,
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
+            self._page = self._context.pages[0] if self._context.pages else self._context.new_page()
+        else:
+            browser = self._playwright.firefox.launch(headless=HEADLESS)
+            self._context = browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
+            self._page = self._context.new_page()
         self.logged_out = False  # updated by _ensure_session; read by the metrics layer
 
         try:
@@ -898,15 +918,27 @@ class ChatSession:
         self._context.add_init_script(FETCH_INTERCEPT_JS)
         _log("[browser] fetch + websocket interceptors registered.")
 
-        # Authentication is the chatgpt.com session cookie (no email/OTP login).
-        cookies = _build_auth_cookies()
-        if cookies:
-            self._context.add_cookies(cookies)
-            _log(f"[browser] Injected {len(cookies)} auth cookie(s); loading chatgpt.com ...")
-        else:
-            _log("[browser] No CHATGPT_SESSION_TOKEN — anonymous (logged-out) mode.")
-
+        # First navigation. With a persistent profile this already carries the saved (and
+        # auto-renewed) ChatGPT session, so we check the ACTUAL logged-in state AFTER loading
+        # rather than inspecting raw cookies (which are unreliable pre-navigation).
         self._page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=60_000)
+
+        bootstrap = True
+        if self._persistent and "/auth" not in self._page.url and not self._looks_logged_out():
+            _log("[browser] Using persisted ChatGPT session (auto-renewing); env cookie not needed.")
+            bootstrap = False
+
+        if bootstrap:
+            cookies = _build_auth_cookies()
+            if cookies:
+                # Bootstrap the session from the env cookie (one-time on a fresh profile, or
+                # a re-bootstrap if the persisted session was lost), then reload.
+                self._context.add_cookies(cookies)
+                _log(f"[browser] Bootstrapped {len(cookies)} auth cookie(s) from env; reloading chatgpt.com ...")
+                self._page.goto("https://chatgpt.com", wait_until="domcontentloaded", timeout=60_000)
+            else:
+                _log("[browser] No session cookie — anonymous (logged-out) mode.")
+
         self._page.evaluate(FETCH_INTERCEPT_JS)  # no-op if the init script already ran
         self._ensure_session()
         _log("[browser] Session ready.")
@@ -1079,8 +1111,16 @@ class ChatSession:
         _log("[session] Session recovered.")
 
     def close(self):
+        # Closing the context flushes + releases the persistent profile dir (so the next
+        # start can reopen it). For a non-persistent context, close the underlying browser.
         try:
-            self._context.browser.close()
+            if getattr(self, "_persistent", False):
+                self._context.close()
+            else:
+                self._context.browser.close()
         except Exception:
             pass
-        self._playwright.stop()
+        try:
+            self._playwright.stop()
+        except Exception:
+            pass

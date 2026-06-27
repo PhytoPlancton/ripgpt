@@ -17,6 +17,11 @@ services:
       - CHATGPT_COOKIES=${CHATGPT_COOKIES:-}
       - INJECT_CF_COOKIES=${INJECT_CF_COOKIES:-false}
       - DEBUG_PAYLOAD=${DEBUG_PAYLOAD:-}
+      # Persist the browser profile so the ChatGPT session survives restarts and
+      # auto-renews — the env cookie becomes a one-time bootstrap (no manual refresh).
+      - BROWSER_PROFILE_DIR=/data/profile
+    volumes:
+      - ripgpt-profile:/data/profile
     restart: unless-stopped
     healthcheck:
       # The app only starts serving once the browser session is ready, so a 200
@@ -54,3 +59,4 @@ services:
 
 volumes:
   open-webui:
+  ripgpt-profile:   # persisted ChatGPT browser session (cookies auto-renew across restarts)
