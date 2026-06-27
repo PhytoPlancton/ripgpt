@@ -57,6 +57,20 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Optional public exposure via Cloudflare Tunnel — no open ports / no static IP needed.
+  # Enable it with:   docker compose --profile tunnel up -d
+  # Setup (once): Cloudflare → Zero Trust → Networks → Tunnels → Create a tunnel (Cloudflared),
+  # copy the token into TUNNEL_TOKEN in .env, then in the tunnel's "Public Hostnames" add
+  # ripgpt.nmt.ovh → Type HTTP → URL http://api:8850. Cloudflare manages the DNS + TLS.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    restart: unless-stopped
+    profiles: ["tunnel"]
+    depends_on:
+      api:
+        condition: service_healthy
+
 volumes:
   open-webui:
   ripgpt-profile:   # persisted ChatGPT browser session (cookies auto-renew across restarts)
