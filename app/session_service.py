@@ -236,15 +236,25 @@ class BrowserSessionService:
             try:
                 self._run_turn(request)
             except Exception as exc:
-                # Self-heal: a wedged composer (timeout waiting for #prompt-textarea) means
-                # the browser is stuck — recreate it and retry the turn once, instead of
-                # requiring a manual `docker compose restart api`.
-                # A composer wedge (#prompt-textarea timeout) is a real stuck-browser
-                # state even on file turns — recover and retry once (re-upload is safe;
-                # legit slow upload/ingest waits don't raise, so they won't false-trip).
-                wedged = ("prompt-textarea" in str(exc)) or ("Timeout" in str(exc)) or ("composer" in str(exc).lower())
-                if wedged:
-                    logger.warning("Session wedged (%s) — recreating browser and retrying once.", str(exc)[:80])
+                msg = str(exc)
+                # A page navigation can tear down a page.evaluate mid-flight ("execution
+                # context was destroyed"). The browser is fine — just retry the turn once
+                # (the SPA has settled by then), no restart needed.
+                nav_race = ("execution context" in msg.lower()) or ("navigation" in msg.lower())
+                # A wedged composer (#prompt-textarea timeout) is a real stuck-browser
+                # state — recreate the browser and retry once (re-upload on file turns is
+                # safe; legit slow upload/ingest waits don't raise, so they won't false-trip).
+                wedged = ("prompt-textarea" in msg) or ("Timeout" in msg) or ("composer" in msg.lower())
+                if nav_race and not wedged:
+                    logger.warning("Navigation race (%s) — retrying turn once.", msg[:80])
+                    time.sleep(1.0)
+                    try:
+                        self._run_turn(request)
+                    except Exception as exc2:
+                        self._put_error(request, exc2)
+                        logger.error("Retry after nav race failed: %s", exc2)
+                elif wedged:
+                    logger.warning("Session wedged (%s) — recreating browser and retrying once.", msg[:80])
                     self._do_restart()
                     try:
                         self._run_turn(request)
@@ -267,15 +277,29 @@ class BrowserSessionService:
     def _start_new_chat(self, temporary: bool = False) -> None:
         assert self._session is not None
         page = self._session._page
+        current = page.url
         target = "https://chatgpt.com/?temporary-chat=true" if temporary else "https://chatgpt.com"
 
-        # ALWAYS navigate to a fresh chat. We must never reuse a chat: ripgpt replays the
-        # whole conversation in the prompt (serialize_messages) and reads the answer from
-        # the DOM, so a reused chat leaves PRIOR answers in the DOM — a stale read can then
-        # return a previous turn's answer (cross-request leak). A fresh chat = empty DOM.
-        page.goto(target, wait_until="domcontentloaded", timeout=30_000)
-        page.evaluate(browser.FETCH_INTERCEPT_JS)
-        browser._ensure_composer(page)
+        # Reuse the current chat when we're already on the right kind of fresh page —
+        # reloading the SPA every turn makes the composer wedge constantly. Staleness from
+        # reuse (a prior answer lingering in the DOM) is handled at READ time via a baseline
+        # snapshot in ChatSession.ask (we reject any read equal to the pre-send answer).
+        if not temporary and current.rstrip("/") == "https://chatgpt.com":
+            return
+        if temporary and "temporary-chat=true" in current and "/c/" not in current:
+            return
+
+        try:
+            page.goto(target, wait_until="domcontentloaded", timeout=30_000)
+            # Wait for the composer (locator auto-waits, tolerates SPA navigation) BEFORE any
+            # raw evaluate, else a late nav tears it down ("execution context destroyed").
+            browser._ensure_composer(page)
+            try:
+                page.evaluate(browser.FETCH_INTERCEPT_JS)   # re-assert; init script already injected it
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.warning("Could not start new chat: %s", exc)
 
     def _stream_answer_via_dom(self, page, chunk_queue: queue.Queue) -> None:
         sent = ""

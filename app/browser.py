@@ -757,7 +757,7 @@ def _log_image_debug(page, raw):
         _log(f"[image][debug] failed: {e}")
 
 
-def _wait_for_answer(page, image=False, files=False, timeout=None):
+def _wait_for_answer(page, image=False, files=False, timeout=None, baseline=""):
     """Wait until the turn truly completes, then return the answer.
 
     Completion is signalled by window.__answer_done — set by the WebSocket interceptor
@@ -796,7 +796,7 @@ def _wait_for_answer(page, image=False, files=False, timeout=None):
         if dom_now != last_dom:
             last_dom = dom_now
             last_change = time.time()
-        if started and dom_now and not _is_generating(page) and (time.time() - last_change) > DOM_STABLE_SECS:
+        if started and dom_now and dom_now != baseline and not _is_generating(page) and (time.time() - last_change) > DOM_STABLE_SECS:
             _log("[*] DOM stable and not generating — accepting answer.")
             break
 
@@ -820,10 +820,15 @@ def _wait_for_answer(page, image=False, files=False, timeout=None):
     time.sleep(0.4)
     dom_answer = _read_answer_from_dom(page)
 
-    if dom_answer:
+    # Prefer the DOM answer ONLY if it's a NEW one (≠ the pre-send baseline). On a reused
+    # chat a lingering previous answer would otherwise be returned to this request; in that
+    # case we keep the per-turn stream parse (built from buffers reset at the start).
+    if dom_answer and dom_answer != baseline:
         if answer and answer != dom_answer:
             _log(f"[*] Preferring final DOM answer ({len(answer)} -> {len(dom_answer)} chars).")
         answer = dom_answer
+    elif dom_answer == baseline and baseline:
+        _log("[*] DOM still shows the previous answer — using the per-turn stream parse instead.")
     elif not answer:
         _log("[*] DOM answer empty and stream parse empty.")
 
@@ -1005,6 +1010,10 @@ class ChatSession:
         self._page.evaluate(FETCH_INTERCEPT_JS)
         self._page.evaluate(RESET_SSE_JS)
         _ensure_composer(self._page)
+        # Snapshot the answer already on screen — if the chat is reused, a previous turn's
+        # answer lingers in the DOM. _wait_for_answer rejects any read equal to this, so it
+        # can never return a PRIOR turn's answer to this request.
+        baseline = _read_answer_from_dom(self._page)
         self._apply_model(model_slug)
         _focus_composer(self._page)
         if files:
@@ -1015,7 +1024,7 @@ class ChatSession:
         self._page.keyboard.insert_text(question)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")
-        return _wait_for_answer(self._page, image=image, files=bool(files),
+        return _wait_for_answer(self._page, image=image, files=bool(files), baseline=baseline,
                                 timeout=FILE_ANSWER_TIMEOUT if files else None)
 
     def send(self, question, model_slug=None, image=False, files=None):
