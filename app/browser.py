@@ -402,14 +402,20 @@ def _parse_sse_answer(raw):
         return _clean_entity_markers(in_progress_snapshots[-1]).strip()
     return ""
 
-def _read_answer_from_dom(page) -> str:
-    """Read the last assistant message from the final rendered DOM as Markdown."""
+def _read_answer_from_dom(page, strict=False) -> str:
+    """Read the last assistant message from the rendered DOM as Markdown.
+
+    strict=True reads ONLY the .markdown answer container and returns '' while it doesn't
+    exist yet (the reasoning / "Thinking" phase lives outside .markdown) — used for live
+    streaming so we never emit the transient "Thinking" indicator."""
     try:
-        text = page.evaluate(r"""() => {
+        text = page.evaluate(r"""(strict) => {
             const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
             if (!msgs.length) return '';
             const last = msgs[msgs.length - 1];
-            const root = last.querySelector('.markdown') || last;
+            const md = last.querySelector('.markdown');
+            if (strict && !md) return '';
+            const root = md || last;
 
             function normalize(text) {
                 return (text || '').replace(/\u00a0/g, ' ');
@@ -532,7 +538,7 @@ def _read_answer_from_dom(page) -> str:
 
             const result = Array.from(root.childNodes).map(blockMd).join('');
             return clean(result);
-        }""")
+        }""", strict)
         return (text or "").strip()
     except Exception:
         return ""

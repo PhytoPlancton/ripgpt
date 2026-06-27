@@ -131,8 +131,10 @@ class BrowserSessionService:
         self._start_new_chat(temporary=request.temporary)
         if request.stream:
             assert isinstance(request.holder, queue.Queue)
+            page = self._session._page
+            baseline = browser._read_answer_from_dom(page)   # previous answer (if chat reused)
             self._session.send(request.prompt, request.model_slug, image=request.image, files=request.files)
-            self._stream_answer_via_dom(self._session._page, request.holder)
+            self._stream_answer_via_dom(page, request.holder, baseline=baseline)
         else:
             assert isinstance(request.holder, dict)
             request.holder["answer"] = self._session.ask(request.prompt, request.model_slug, image=request.image, files=request.files)
@@ -301,7 +303,7 @@ class BrowserSessionService:
         except Exception as exc:
             logger.warning("Could not start new chat: %s", exc)
 
-    def _stream_answer_via_dom(self, page, chunk_queue: queue.Queue) -> None:
+    def _stream_answer_via_dom(self, page, chunk_queue: queue.Queue, baseline: str = "") -> None:
         sent = ""
         previous_safe = ""
         deadline = time.time() + browser.ANSWER_TIMEOUT
@@ -315,8 +317,12 @@ class BrowserSessionService:
             # (__sse_done) fires too early now that answers stream over the socket.
             done = bool(page.evaluate("() => !!window.__answer_done"))
             started = started or bool(page.evaluate("() => !!window.__turn_started"))
-            current_markdown = browser._read_answer_from_dom(page)
-            safe_prefix = self._stream_safe_prefix(current_markdown, done=False)
+            # strict=True → only the .markdown answer container (skips the "Thinking"
+            # reasoning phase). Ignore a lingering previous answer (reused chat) via baseline.
+            current_markdown = browser._read_answer_from_dom(page, strict=True)
+            if not current_markdown or current_markdown == baseline:
+                current_markdown = ""
+            safe_prefix = self._stream_safe_prefix(current_markdown, done=False) if current_markdown else ""
 
             if previous_safe:
                 stable_length = self._common_prefix_len(previous_safe, safe_prefix)
@@ -336,7 +342,11 @@ class BrowserSessionService:
 
             if done:
                 time.sleep(0.4)
-                final_markdown = browser._read_answer_from_dom(page)
+                final_markdown = browser._read_answer_from_dom(page, strict=True)
+                if not final_markdown or final_markdown == baseline:
+                    # strict empty/stale — fall back to the full read, but never the baseline.
+                    nf = browser._read_answer_from_dom(page)
+                    final_markdown = nf if (nf and nf != baseline) else sent
                 if len(final_markdown) > len(sent):
                     chunk_queue.put(final_markdown[len(sent):])
                 break
