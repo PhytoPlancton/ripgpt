@@ -83,9 +83,11 @@ _SECRET = _load_or_create_secret()
 
 # ── password ──────────────────────────────────────────────────────────────────
 def hash_password(password: str, iterations: int = _PBKDF2_ITERS) -> str:
+    # Use "." as the field separator (NOT "$"): a "$" in an .env value gets mangled by
+    # docker-compose interpolation. base64 never contains ".", so this stays unambiguous.
     salt = secrets.token_bytes(16)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
-    return "pbkdf2${}${}${}".format(
+    return "pbkdf2.{}.{}.{}".format(
         iterations,
         base64.b64encode(salt).decode("ascii"),
         base64.b64encode(dk).decode("ascii"),
@@ -94,7 +96,9 @@ def hash_password(password: str, iterations: int = _PBKDF2_ITERS) -> str:
 
 def verify_password(password: str, stored: str) -> bool:
     try:
-        algo, iters, salt_b64, hash_b64 = stored.split("$")
+        # Accept both the "." format and the legacy "$" format (defensive).
+        sep = "." if stored.startswith("pbkdf2.") else "$"
+        algo, iters, salt_b64, hash_b64 = stored.split(sep)
         if algo != "pbkdf2":
             return False
         salt = base64.b64decode(salt_b64)
