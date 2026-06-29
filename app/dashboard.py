@@ -245,7 +245,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       </div>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>name</th><th>prefix</th><th>requests</th><th>last used</th><th></th></tr></thead>
+          <thead><tr><th>name</th><th>prefix</th><th>requests</th><th>~API cost</th><th>last used</th><th></th></tr></thead>
           <tbody id="keysBody"><tr><td colspan="5" class="muted">loading…</td></tr></tbody>
         </table>
       </div>
@@ -350,10 +350,12 @@ function render(s){
 }
 
 function fmtN(n){ if(n>=1e6) return (n/1e6).toFixed(1)+'M'; if(n>=1000) return (n/1000).toFixed(n>=10000?0:1)+'k'; return ''+n; }
+function fmtMoney(v){ v=v||0; if(v>=1000) return '$'+(v/1000).toFixed(2)+'k'; if(v>=1) return '$'+v.toFixed(2); if(v>=0.01) return '$'+v.toFixed(3); return v>0?('$'+v.toFixed(4)):'$0'; }
 function drawUsage(s){
-  const lt=s.lifetime||{requests:0,models:0,ctoks:0};
-  $('usageTotals').textContent = lt.requests
+  const lt=s.lifetime||{requests:0,models:0,ctoks:0,cost:0};
+  $('usageTotals').innerHTML = lt.requests
     ? '· '+lt.requests+' requests · '+lt.models+' models'+(lt.images?' · '+lt.images+' images':'')+' · ~'+fmtN(lt.ctoks||0)+' tokens out'
+      +' · <b style="color:var(--green)">~'+fmtMoney(lt.cost)+'</b> coût API évité'
     : '';
   const arr=s.by_model_usage||[];
   if(!arr.length){ $('usageGrid').innerHTML='<div class="muted">no requests yet</div>'; return; }
@@ -374,6 +376,7 @@ function drawUsage(s){
         <span><b style="color:${m.err?'var(--red)':'var(--muted)'}">${m.err}</b> err</span>
         <span>p95 <b>${p95}</b></span>
         ${m.images?('<span><b class="ok">🖼 '+m.images+'</b> img</span>'):('<span>out <b>'+tok+'</b></span>')}
+        <span>~<b style="color:var(--green)">${fmtMoney(m.cost)}</b> API</span>
         <span>last <b>${rel(m.last_ts)}</b></span>
       </div>
     </div>`;
@@ -432,15 +435,16 @@ async function loadKeys(){
 }
 function renderKeysUsage(){
   const usage={}; (LAST_STATS.by_key_usage||[]).forEach(k=>usage[k.key_id]=k);
-  if(!KEYS_CACHE.length){ $('keysBody').innerHTML='<tr><td colspan=5 class=muted>no keys — create one</td></tr>'; return; }
+  if(!KEYS_CACHE.length){ $('keysBody').innerHTML='<tr><td colspan=6 class=muted>no keys — create one</td></tr>'; return; }
   $('keysBody').innerHTML=KEYS_CACHE.map(k=>{
-    const u=usage[k.id]||{requests:0,last_ts:null};
+    const u=usage[k.id]||{requests:0,last_ts:null,cost:0};
     const rev=k.revoked;
     const nm=esc(k.name)+(rev?' <span class="tag" style="color:var(--red);border-color:#3b1c28">revoked</span>':'');
     const act=rev?'':`<button class="warn" onclick="revokeKey('${esc(k.id)}')">revoke</button>`;
     return `<tr style="${rev?'opacity:.5':''}">
       <td>${nm}</td><td class=muted>${esc(k.prefix)}…</td>
-      <td>${u.requests||0}</td><td class=muted>${u.last_ts?rel(u.last_ts):(k.last_used?rel(k.last_used):'never')}</td>
+      <td>${u.requests||0}</td><td style="color:var(--green)">~${fmtMoney(u.cost)}</td>
+      <td class=muted>${u.last_ts?rel(u.last_ts):(k.last_used?rel(k.last_used):'never')}</td>
       <td style="text-align:right">${act}</td></tr>`;
   }).join('');
 }

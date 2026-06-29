@@ -11,6 +11,8 @@ import threading
 import time
 from collections import deque
 
+from app import pricing
+
 # Error taxonomy surfaced on the dashboard.
 ERROR_CLASSES = ("empty_reply", "composer_timeout", "logged_out", "http_500", "nav_error", "timeout", "other")
 
@@ -57,6 +59,7 @@ class Metrics:
                key_id: str | None = None) -> None:
         now = time.time()
         mres = model_res or model_req
+        cost = pricing.cost_for(mres, int(ptoks), int(ctoks), int(images))
         rec = {
             "ts": now,
             "model_req": model_req,
@@ -73,21 +76,23 @@ class Metrics:
             if key_id:
                 k = self._by_key.setdefault(
                     key_id, {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
-                             "images": 0, "last_ts": None})
+                             "images": 0, "last_ts": None, "cost": 0.0})
                 k["req"] += 1
                 k["last_ts"] = now
                 k["ptoks"] += int(ptoks)
                 k["ctoks"] += int(ctoks)
                 k["images"] += int(images)
+                k["cost"] = k.get("cost", 0.0) + cost
                 k["ok" if status == "ok" else "err"] += 1
             lt = self._lifetime.setdefault(
                 mres, {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
-                       "images": 0, "last_ts": None, "lat_sum": 0, "lat_n": 0})
+                       "images": 0, "last_ts": None, "lat_sum": 0, "lat_n": 0, "cost": 0.0})
             lt["req"] += 1
             lt["last_ts"] = now
             lt["ptoks"] += int(ptoks)
             lt["ctoks"] += int(ctoks)
             lt["images"] += int(images)
+            lt["cost"] = lt.get("cost", 0.0) + cost
             if status == "ok":
                 lt["ok"] += 1
                 lt["lat_sum"] += int(latency_ms)
@@ -149,6 +154,7 @@ class Metrics:
                 "images": d.get("images", 0),
                 "avg_latency_ms": int(d["lat_sum"] / d["lat_n"]) if d["lat_n"] else 0,
                 "p95_latency_ms": hour_p95.get(m, 0),
+                "cost": round(d.get("cost", 0.0), 4),
                 "last_ts": d["last_ts"],
             })
         by_model_usage.sort(key=lambda x: -x["requests"])
@@ -158,6 +164,7 @@ class Metrics:
             "err": sum(d["err"] for d in lifetime.values()),
             "ctoks": sum(d["ctoks"] for d in lifetime.values()),
             "images": sum(d.get("images", 0) for d in lifetime.values()),
+            "cost": round(sum(d.get("cost", 0.0) for d in lifetime.values()), 4),
             "models": len(lifetime),
             "since": started,
         }
@@ -197,6 +204,7 @@ class Metrics:
                 "ptoks": d["ptoks"],
                 "ctoks": d["ctoks"],
                 "images": d.get("images", 0),
+                "cost": round(d.get("cost", 0.0), 4),
                 "last_ts": d["last_ts"],
             })
         by_key_usage.sort(key=lambda x: -x["requests"])

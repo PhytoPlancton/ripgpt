@@ -890,14 +890,16 @@ def create_app() -> FastAPI:
         buf = io.StringIO()
         w = csv.writer(buf)
         w.writerow(["section", "name", "requests", "ok", "err", "prompt_tokens",
-                    "completion_tokens", "images", "last_used_unix"])
+                    "completion_tokens", "images", "est_api_cost_usd", "last_used_unix"])
         for m in snap.get("by_model_usage", []):
             w.writerow(["model", _safe_cell(m["model"]), m["requests"], m["ok"], m["err"],
-                        m["ptoks"], m["ctoks"], m.get("images", 0), m.get("last_ts") or ""])
+                        m["ptoks"], m["ctoks"], m.get("images", 0),
+                        m.get("cost", 0.0), m.get("last_ts") or ""])
         for k in snap.get("by_key_usage", []):
             label = names.get(k["key_id"], k["key_id"])
             w.writerow(["key", _safe_cell(f"{label} ({k['key_id']})"), k["requests"], k["ok"], k["err"],
-                        k["ptoks"], k["ctoks"], k.get("images", 0), k.get("last_ts") or ""])
+                        k["ptoks"], k["ctoks"], k.get("images", 0),
+                        k.get("cost", 0.0), k.get("last_ts") or ""])
         return Response(content=buf.getvalue(), media_type="text/csv", headers={
             "Content-Disposition": 'attachment; filename="ripgpt-usage.csv"'})
 
