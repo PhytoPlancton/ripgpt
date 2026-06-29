@@ -7,6 +7,8 @@ because requests are recorded from the API thread while /stats reads concurrentl
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from collections import deque
@@ -15,6 +17,17 @@ from app import pricing
 
 # Error taxonomy surfaced on the dashboard.
 ERROR_CLASSES = ("empty_reply", "composer_timeout", "logged_out", "http_500", "nav_error", "timeout", "other")
+
+# Persist the cumulative (all-time) counters to the data volume so a restart doesn't reset
+# usage / cost. The ring buffer + 1-min series stay in memory (live-only) by design.
+_METRICS_FILE = os.environ.get("METRICS_FILE") or os.path.join(
+    os.environ.get("BROWSER_PROFILE_DIR") or ".", "metrics.json")
+_PERSIST_INTERVAL = float(os.environ.get("METRICS_PERSIST_INTERVAL", "30"))
+
+_LIFETIME_DEFAULTS = {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
+                      "images": 0, "last_ts": None, "lat_sum": 0, "lat_n": 0, "cost": 0.0}
+_BYKEY_DEFAULTS = {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
+                   "images": 0, "last_ts": None, "cost": 0.0}
 
 
 def classify_error(message: str) -> str:
@@ -41,7 +54,7 @@ def _percentile(values: list[float], pct: float) -> float:
 
 
 class Metrics:
-    def __init__(self, max_recent: int = 500):
+    def __init__(self, max_recent: int = 500, path: str = _METRICS_FILE):
         self._lock = threading.Lock()
         self._recent: deque = deque(maxlen=max_recent)
         self.last_success_ts: float | None = None
@@ -52,6 +65,45 @@ class Metrics:
         self._lifetime: dict[str, dict] = {}
         # Cumulative per-API-key counters (key_id -> stats), for the admin keys panel.
         self._by_key: dict[str, dict] = {}
+        self._path = path
+        self._last_persist = 0.0
+        self._load()
+
+    # ── persistence (all-time counters only) ───────────────────────────────────
+    def _load(self) -> None:
+        try:
+            with open(self._path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+        self._lifetime = {m: {**_LIFETIME_DEFAULTS, **d}
+                          for m, d in (data.get("lifetime") or {}).items() if isinstance(d, dict)}
+        self._by_key = {k: {**_BYKEY_DEFAULTS, **d}
+                        for k, d in (data.get("by_key") or {}).items() if isinstance(d, dict)}
+        if data.get("last_success_ts") is not None:
+            self.last_success_ts = data["last_success_ts"]
+        if data.get("started_ts"):
+            self.started_ts = data["started_ts"]   # keep the true first-ever start
+
+    def _save_locked(self) -> None:
+        data = {"lifetime": self._lifetime, "by_key": self._by_key,
+                "last_success_ts": self.last_success_ts, "started_ts": self.started_ts}
+        try:
+            os.makedirs(os.path.dirname(self._path) or ".", exist_ok=True)
+            tmp = self._path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            os.replace(tmp, self._path)   # atomic
+            self._last_persist = time.time()
+        except Exception:
+            pass
+
+    def save(self) -> None:
+        """Flush counters to disk (call on shutdown)."""
+        with self._lock:
+            self._save_locked()
 
     def record(self, *, model_req: str, model_res: str | None, status: str,
                error_class: str | None, latency_ms: int,
@@ -105,6 +157,9 @@ class Metrics:
                 self.consecutive_failures += 1
                 if error_class in ("empty_reply", "composer_timeout", "timeout"):
                     self.consecutive_empty_or_timeout += 1
+            # Throttled persist so a restart keeps all-time usage/cost.
+            if now - self._last_persist >= _PERSIST_INTERVAL:
+                self._save_locked()
 
     def _window(self, recs: list, seconds: float, now: float) -> list:
         cutoff = now - seconds

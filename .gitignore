@@ -16,6 +16,8 @@ edj-stack.yml
 .admin_token_version
 keys.json
 keys.json.tmp
+metrics.json
+metrics.json.tmp
 
 # Backups & logs
 *.bak

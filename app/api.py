@@ -422,6 +422,10 @@ async def _lifespan(_: FastAPI):
     try:
         yield
     finally:
+        try:
+            METRICS.save()   # flush all-time counters so a restart keeps usage/cost
+        except Exception:
+            pass
         SERVICE.stop()
 
 
