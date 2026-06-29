@@ -16,8 +16,17 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse, Response
 
 from app.metrics import METRICS, classify_error
-from app.dashboard import DASHBOARD_HTML
+from app.dashboard import DASHBOARD_HTML, LOGIN_HTML, SETUP_HTML
 from app.imagestore import IMAGES, ext_for
+from app.keystore import KEYS
+from app import auth
+from app.auth import (
+    SESSION_COOKIE, CSRF_COOKIE, SESSION_TTL,
+    admin_configured, check_login, make_session, read_session,
+    issue_csrf, verify_csrf, client_ip, cookie_secure,
+    login_locked, record_login_fail, reset_login_fails,
+    bump_token_version,
+)
 from app.openai_models import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -42,14 +51,82 @@ API_KEY = os.environ.get("API_KEY", "")
 # Hard ceiling on request body size (file uploads are base64, so ~135 MB covers the
 # 100 MB cumulative file cap with overhead). Rejected at the edge before buffering.
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(160 * 1024 * 1024)))
+# Admission control: a single browser serves all turns serially, so an unbounded queue
+# lets one caller starve everyone for minutes. Shed load with 503 + Retry-After once the
+# backlog is this deep.
+MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "12"))
 
 
+def _overloaded_response():
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"message": "Server busy — too many requests queued. Retry shortly.",
+                           "type": "server_error", "code": "overloaded"}},
+        headers={"Retry-After": "10"},
+    )
+
+
+def _queue_overloaded() -> bool:
+    try:
+        return SERVICE.queue_depth() >= MAX_QUEUE_DEPTH
+    except Exception:
+        return False
+
+
+def _bearer(request: Request) -> str:
+    auth_h = request.headers.get("Authorization", "")
+    return auth_h[len("Bearer "):] if auth_h.startswith("Bearer ") else ""
+
+
+def _authorize_request(request: Request) -> str:
+    """Validate the client's API key against the key store and return its key_id.
+
+    Fail-closed: an unknown/revoked/missing key is always rejected. There is no
+    "empty API_KEY disables auth" escape hatch — if the store has no keys, nothing
+    authenticates (the operator seeds one via API_KEY env or the admin console).
+    """
+    rec = KEYS.validate(_bearer(request))
+    if not rec:
+        raise HTTPException(status_code=401, detail={
+            "message": "Invalid or missing API key.",
+            "type": "invalid_request_error", "code": "invalid_api_key"})
+    KEYS.touch(rec["id"])
+    return rec["id"]
+
+
+# Back-compat alias for the read-only model endpoints (they don't need the key_id).
 def _require_api_key(request: Request) -> None:
-    if not API_KEY:
-        return
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer ") or auth[len("Bearer "):] != API_KEY:
-        raise HTTPException(status_code=401, detail={"message": "Invalid or missing API key.", "type": "invalid_request_error", "code": "invalid_api_key"})
+    _authorize_request(request)
+
+
+# ── admin session helpers ─────────────────────────────────────────────────────
+def _admin_uid(request: Request) -> str | None:
+    return read_session(request.cookies.get(SESSION_COOKIE))
+
+
+def _require_admin(request: Request) -> str:
+    uid = _admin_uid(request)
+    if not uid:
+        raise HTTPException(status_code=401, detail={
+            "message": "Admin login required.",
+            "type": "invalid_request_error", "code": "login_required"})
+    return uid
+
+
+def _check_csrf(request: Request) -> None:
+    if not verify_csrf(request.cookies.get(CSRF_COOKIE), request.headers.get(auth.CSRF_HEADER)):
+        raise HTTPException(status_code=403, detail={
+            "message": "CSRF check failed.",
+            "type": "invalid_request_error", "code": "csrf_failed"})
+
+
+def _set_admin_cookies(resp: Response, request: Request, uid: str) -> None:
+    secure = cookie_secure(request)
+    resp.set_cookie(SESSION_COOKIE, make_session(uid), max_age=SESSION_TTL,
+                    httponly=True, secure=secure, samesite="lax", path="/")
+    # CSRF token must be readable by JS (double-submit), so NOT HttpOnly.
+    resp.set_cookie(CSRF_COOKIE, issue_csrf(), max_age=SESSION_TTL,
+                    httponly=False, secure=secure, samesite="lax", path="/")
 
 SERVICE = BrowserSessionService()
 
@@ -103,6 +180,28 @@ def _error_response(message: str, status_code: int = 400, error_type: str = "inv
     if code is not None:
         error["code"] = code
     return JSONResponse(status_code=status_code, content={"error": error})
+
+
+def _html(content: str, status_code: int = 200):
+    # Frame-protection so the admin console can't be clickjacked, plus a tight referrer.
+    return HTMLResponse(content, status_code=status_code, headers={
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": "frame-ancestors 'none'",
+        "Referrer-Policy": "no-referrer",
+    })
+
+
+def _safe_upstream_error(exc) -> str:
+    """Log the full exception server-side; return a sanitized client message.
+
+    Raw browser/Playwright exception text leaks internal selectors, timeouts, paths and
+    env/cookie variable names — useful reconnaissance for an authenticated attacker. We
+    expose only a stable category + an opaque ref id and keep the detail in the logs.
+    Accepts an Exception or a raw error string.
+    """
+    ref = uuid.uuid4().hex[:12]
+    log.error("upstream error ref=%s: %s", ref, exc, exc_info=isinstance(exc, BaseException))
+    return f"Upstream request failed ({classify_error(str(exc))}). ref={ref}"
 
 
 def _resolve_model(model: str) -> str | None:
@@ -301,6 +400,20 @@ def _consume_stop_buffer(buffer: str, stop_sequences: list[str]) -> tuple[str, s
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI):
+    # Seed the legacy single API_KEY into the multi-key store so existing integrations
+    # keep working; thereafter keys are managed from the admin console.
+    KEYS.seed_from_env(API_KEY)
+    if not KEYS.list():
+        log.warning("No API keys configured — ALL /v1 requests will be rejected (401). "
+                    "Set API_KEY in .env to seed one, or create keys in the admin console.")
+    if not admin_configured():
+        log.warning("ADMIN_USER / ADMIN_PASSWORD_HASH not set — admin console is LOCKED "
+                    "(no login possible). Run `python -m app.adminpw` to generate a hash.")
+    elif not auth.TRUST_PROXY_HEADERS and not PUBLIC_BASE_URL.lower().startswith("https"):
+        log.warning("Admin is configured but PUBLIC_BASE_URL is not https and "
+                    "TRUST_PROXY_HEADERS is off — admin cookies may be issued WITHOUT the "
+                    "Secure flag. On a public HTTPS deploy set PUBLIC_BASE_URL=https://… "
+                    "(and TRUST_PROXY_HEADERS=true behind a trusted tunnel).")
     SERVICE.start()
     if not SERVICE.wait_until_ready():
         raise RuntimeError("Browser session did not become ready in time.")
@@ -312,38 +425,100 @@ async def _lifespan(_: FastAPI):
         SERVICE.stop()
 
 
+class _BodyLimitMiddleware:
+    """ASGI middleware enforcing a hard request-body byte ceiling.
+
+    Buffers the body up to max_bytes and rejects with 413 once exceeded, regardless of
+    how the size is declared. This closes the chunked/absent-Content-Length bypass of a
+    header-only check, which could otherwise OOM the single-worker proxy pre-auth.
+    """
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            return await self.app(scope, receive, send)
+        # Fast path: honestly-declared oversize length.
+        for name, value in scope.get("headers") or []:
+            if name == b"content-length" and value.isdigit() and int(value) > self.max_bytes:
+                return await self._reject(send)
+
+        body = bytearray()
+        over = False
+        disconnected = False
+        while True:
+            message = await receive()
+            mtype = message.get("type")
+            if mtype == "http.request":
+                body += message.get("body", b"")
+                if len(body) > self.max_bytes:
+                    over = True
+                    break
+                if not message.get("more_body", False):
+                    break
+            elif mtype == "http.disconnect":
+                disconnected = True
+                break
+            else:
+                break
+        if over:
+            return await self._reject(send)
+
+        replayed = False
+
+        async def replay():
+            nonlocal replayed
+            if disconnected:
+                return {"type": "http.disconnect"}
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            # After replaying the buffered body, forward to the real receive() so genuine
+            # client disconnects propagate. Synthesizing http.disconnect here would make
+            # Starlette's StreamingResponse think the client hung up and cancel SSE output.
+            return await receive()
+
+        return await self.app(scope, replay, send)
+
+    async def _reject(self, send):
+        payload = json.dumps({"error": {
+            "message": "Request body too large.",
+            "type": "invalid_request_error", "code": "payload_too_large"}}).encode()
+        await send({"type": "http.response.start", "status": 413, "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode())]})
+        await send({"type": "http.response.body", "body": payload})
+
+
 def create_app() -> FastAPI:
     app = FastAPI(title="RipGPT API", lifespan=_lifespan)
-
-    @app.middleware("http")
-    async def _limit_body(request: Request, call_next):
-        # Reject oversized bodies up front (before Starlette buffers them) so a huge
-        # file/base64 payload can't OOM the single-worker proxy.
-        cl = request.headers.get("content-length")
-        if cl and cl.isdigit() and int(cl) > MAX_BODY_BYTES:
-            return _error_response("Request body too large.", status_code=413,
-                                   error_type="invalid_request_error", code="payload_too_large")
-        return await call_next(request)
+    # Hard body-size cap enforced by counting bytes (handles chunked / absent
+    # Content-Length, which the old header-only check let through → OOM risk).
+    app.add_middleware(_BodyLimitMiddleware, max_bytes=MAX_BODY_BYTES)
 
     @app.get("/v1/models")
     @app.get("/models")
     async def list_models(request: Request):
         _require_api_key(request)
-        return {"object": "list", "data": [_make_model_card(m) for m in MODELS]}
+        disabled = KEYS.disabled_models()
+        return {"object": "list",
+                "data": [_make_model_card(m) for m in MODELS if m not in disabled]}
 
     @app.get("/v1/models/{model}")
     @app.get("/models/{model}")
     async def retrieve_model(model: str, request: Request):
         _require_api_key(request)
         resolved = _resolve_model(model)
-        if resolved is None:
+        if resolved is None or not KEYS.is_model_enabled(resolved):
             return _error_response(f"The model '{model}' does not exist.", status_code=404, error_type="invalid_request_error", code="model_not_found")
         return _make_model_card(resolved)
 
     @app.post("/v1/chat/completions")
     @app.post("/chat/completions")
     async def chat_completions(payload: ChatCompletionRequest, request: Request):
-        _require_api_key(request)
+        key_id = _authorize_request(request)
         if os.environ.get("DEBUG_PAYLOAD"):
             for i, m in enumerate(payload.messages):
                 c = m.content
@@ -359,7 +534,7 @@ def create_app() -> FastAPI:
                         elif isinstance(it, dict):
                             log.info("[payload]   part=%s keys=%s", it.get("type"), list(it.keys()))
         resolved_model = _resolve_model(payload.model)
-        if resolved_model is None:
+        if resolved_model is None or not KEYS.is_model_enabled(resolved_model):
             return _error_response(f"The model '{payload.model}' does not exist.", status_code=404, error_type="invalid_request_error", code="model_not_found")
         if payload.n != 1:
             return _error_response("Only n=1 is supported.")
@@ -392,6 +567,8 @@ def create_app() -> FastAPI:
 
         if SERVICE.is_paused():
             return _error_response("Proxy is paused.", status_code=503, error_type="server_error", code="paused")
+        if _queue_overloaded():
+            return _overloaded_response()
 
         if payload.stream:
             return StreamingResponse(
@@ -407,6 +584,7 @@ def create_app() -> FastAPI:
                     base_url=_base_url(request),
                     stop=payload.stop,
                     include_usage=bool(payload.stream_options and payload.stream_options.include_usage),
+                    key_id=key_id,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -417,8 +595,9 @@ def create_app() -> FastAPI:
             answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug, image=image, files=files)
         except Exception as exc:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
-                           error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
-            return _error_response(str(exc), status_code=500, error_type="server_error")
+                           error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
+                           key_id=key_id)
+            return _error_response(_safe_upstream_error(exc), status_code=500, error_type="server_error")
 
         latency_ms = int((time.time() - t0) * 1000)
         answer, n_img = _externalize_images(answer, _base_url(request))
@@ -426,15 +605,16 @@ def create_app() -> FastAPI:
         ok = bool(answer.strip())
         METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
                        error_class=None if ok else "empty_reply", latency_ms=latency_ms,
-                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img)
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img,
+                       key_id=key_id)
         return _make_chat_completion_response(completion_id, created, resolved_model, answer, prompt)
 
     @app.post("/v1/completions")
     @app.post("/completions")
     async def completions(payload: CompletionRequest, request: Request):
-        _require_api_key(request)
+        key_id = _authorize_request(request)
         resolved_model = _resolve_model(payload.model)
-        if resolved_model is None:
+        if resolved_model is None or not KEYS.is_model_enabled(resolved_model):
             return _error_response(f"The model '{payload.model}' does not exist.", status_code=404, error_type="invalid_request_error", code="model_not_found")
         if payload.n != 1:
             return _error_response("Only n=1 is supported.")
@@ -449,6 +629,8 @@ def create_app() -> FastAPI:
 
         if SERVICE.is_paused():
             return _error_response("Proxy is paused.", status_code=503, error_type="server_error", code="paused")
+        if _queue_overloaded():
+            return _overloaded_response()
 
         if payload.stream:
             return StreamingResponse(
@@ -462,6 +644,7 @@ def create_app() -> FastAPI:
                     image=image,
                     base_url=_base_url(request),
                     stop=payload.stop,
+                    key_id=key_id,
                 ),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
@@ -472,8 +655,9 @@ def create_app() -> FastAPI:
             answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug, image=image)
         except Exception as exc:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
-                           error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
-            return _error_response(str(exc), status_code=500, error_type="server_error")
+                           error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
+                           key_id=key_id)
+            return _error_response(_safe_upstream_error(exc), status_code=500, error_type="server_error")
 
         latency_ms = int((time.time() - t0) * 1000)
         answer, n_img = _externalize_images(answer, _base_url(request))
@@ -481,7 +665,8 @@ def create_app() -> FastAPI:
         ok = bool(answer.strip())
         METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
                        error_class=None if ok else "empty_reply", latency_ms=latency_ms,
-                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img)
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img,
+                       key_id=key_id)
         return _make_completion_response(completion_id, created, resolved_model, answer, prompt)
 
     @app.get("/health")
@@ -506,33 +691,215 @@ def create_app() -> FastAPI:
             "Content-Disposition": f'inline; filename="{iid.split(".")[0]}.{ext_for(mime)}"',
         })
 
+    # ── admin console (gated behind login) ────────────────────────────────────
     @app.get("/")
     @app.get("/dashboard")
-    async def dashboard():
-        return HTMLResponse(DASHBOARD_HTML)
+    async def dashboard(request: Request):
+        # Fail-closed: with no admin creds the console is locked behind a setup notice;
+        # with creds but no valid session, the login page; only a live session sees data.
+        if not admin_configured():
+            return _html(SETUP_HTML)
+        if not _admin_uid(request):
+            return _html(LOGIN_HTML, status_code=401)
+        return _html(DASHBOARD_HTML)
+
+    @app.get("/login")
+    async def login_page(request: Request):
+        if not admin_configured():
+            return _html(SETUP_HTML)
+        if _admin_uid(request):
+            return _html(DASHBOARD_HTML)
+        return _html(LOGIN_HTML)
+
+    @app.post("/admin/login")
+    async def admin_login(request: Request):
+        if not admin_configured():
+            return _error_response("Admin console is not configured.", status_code=503,
+                                   error_type="server_error", code="admin_not_configured")
+        ip = client_ip(request)
+        rem = login_locked(ip)
+        if rem > 0:
+            return _error_response(f"Too many attempts. Try again in {int(rem)}s.",
+                                   status_code=429, error_type="invalid_request_error",
+                                   code="rate_limited")
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        user = str(body.get("username", ""))
+        pw = str(body.get("password", ""))
+        if not check_login(user, pw):
+            record_login_fail(ip)
+            return _error_response("Invalid username or password.", status_code=401,
+                                   error_type="invalid_request_error", code="invalid_credentials")
+        reset_login_fails(ip)
+        resp = JSONResponse({"ok": True})
+        _set_admin_cookies(resp, request, user)
+        return resp
+
+    @app.post("/admin/logout")
+    async def admin_logout(request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        # Stateless tokens can't be individually revoked; bumping the token_version
+        # invalidates ALL outstanding sessions server-side (single-admin tool, so a
+        # global logout is the desired behaviour — a stolen cookie stops working now).
+        bump_token_version()
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(SESSION_COOKIE, path="/")
+        resp.delete_cookie(CSRF_COOKIE, path="/")
+        return resp
 
     @app.get("/stats")
     async def stats(request: Request):
-        _require_api_key(request)
+        # Session-only: the snapshot includes per-key usage of ALL keys, so it must not
+        # be reachable with a single data-plane API key (cross-tenant disclosure).
+        _require_admin(request)
         snap = METRICS.snapshot()
         snap["live"] = SERVICE.live_state()
         return snap
 
     @app.post("/admin/restart-session")
     async def admin_restart(request: Request):
-        _require_api_key(request)
+        # Operational kill/restart controls are admin-session only (a data-plane key must
+        # not be able to restart or pause the shared browser for everyone).
+        _require_admin(request)
+        _check_csrf(request)
         ok = await asyncio.to_thread(SERVICE.request_restart)
         return {"restarted": bool(ok)}
 
     @app.post("/admin/pause")
     async def admin_pause(request: Request):
-        _require_api_key(request)
+        _require_admin(request)
+        _check_csrf(request)
         try:
             body = await request.json()
         except Exception:
             body = {}
         SERVICE.set_paused(bool(body.get("paused", not SERVICE.is_paused())))
         return {"paused": SERVICE.is_paused()}
+
+    # ── API key management (session-only + CSRF on mutations) ──────────────────
+    @app.get("/admin/keys")
+    async def admin_keys_list(request: Request):
+        _require_admin(request)
+        return {"keys": KEYS.list()}
+
+    @app.post("/admin/keys")
+    async def admin_keys_create(request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        name = str(body.get("name", "")).strip()
+        secret, record = KEYS.create(name)
+        # The plaintext secret is returned exactly once here and never stored.
+        return {"key": secret, "record": record}
+
+    @app.post("/admin/keys/{kid}/revoke")
+    async def admin_keys_revoke(kid: str, request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        return {"revoked": KEYS.revoke(kid)}
+
+    # ── model enable/disable ───────────────────────────────────────────────────
+    @app.get("/admin/models")
+    async def admin_models_list(request: Request):
+        _require_admin(request)
+        disabled = KEYS.disabled_models()
+        return {"models": [
+            {"id": m, "enabled": m not in disabled,
+             "image": bool(cfg.get("image")), "temporary": bool(cfg.get("temporary"))}
+            for m, cfg in MODELS.items()
+        ]}
+
+    @app.post("/admin/models/toggle")
+    async def admin_models_toggle(request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        model = str(body.get("model", ""))
+        enabled = bool(body.get("enabled", True))
+        if model not in MODELS:
+            return _error_response(f"Unknown model '{model}'.", status_code=404,
+                                   error_type="invalid_request_error", code="model_not_found")
+        KEYS.set_model_disabled(model, not enabled)
+        return {"model": model, "enabled": enabled}
+
+    # ── test prompt from the console ───────────────────────────────────────────
+    @app.post("/admin/test")
+    async def admin_test(request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        model = str(body.get("model", "auto"))
+        prompt = str(body.get("prompt", "")).strip()
+        resolved = _resolve_model(model)
+        if resolved is None or not KEYS.is_model_enabled(resolved):
+            return _error_response(f"The model '{model}' is unavailable.", status_code=404,
+                                   error_type="invalid_request_error", code="model_not_found")
+        if not prompt:
+            return _error_response("No prompt provided.")
+        if len(prompt) > 8000:
+            return _error_response("Test prompt too long (max 8000 chars).", status_code=413,
+                                   error_type="invalid_request_error", code="payload_too_large")
+        if SERVICE.is_paused():
+            return _error_response("Proxy is paused.", status_code=503,
+                                   error_type="server_error", code="paused")
+        temporary, slug, image = _model_config(resolved, prompt)
+        t0 = time.time()
+        try:
+            answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, slug, image, None)
+        except Exception as exc:
+            METRICS.record(model_req=resolved, model_res=slug, status="error",
+                           error_class=classify_error(str(exc)),
+                           latency_ms=int((time.time() - t0) * 1000), key_id="console")
+            return _error_response(_safe_upstream_error(exc), status_code=500, error_type="server_error")
+        latency_ms = int((time.time() - t0) * 1000)
+        answer, n_img = _externalize_images(answer, _base_url(request))
+        ok = bool(answer.strip())
+        METRICS.record(model_req=resolved, model_res=slug, status="ok" if ok else "error",
+                       error_class=None if ok else "empty_reply", latency_ms=latency_ms,
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img,
+                       key_id="console")
+        return {"model": resolved, "answer": answer, "latency_ms": latency_ms, "images": n_img}
+
+    # ── usage export ───────────────────────────────────────────────────────────
+    @app.get("/admin/usage.csv")
+    async def admin_usage_csv(request: Request):
+        _require_admin(request)
+        import csv
+        import io
+        snap = METRICS.snapshot()
+        names = {k["id"]: k.get("name", "") for k in KEYS.list()}
+
+        def _safe_cell(v):
+            # Neutralise spreadsheet formula injection: a leading =,+,-,@ (or tab/CR) in a
+            # text cell can execute when the CSV is opened in Excel/Sheets.
+            s = "" if v is None else str(v)
+            return ("'" + s) if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["section", "name", "requests", "ok", "err", "prompt_tokens",
+                    "completion_tokens", "images", "last_used_unix"])
+        for m in snap.get("by_model_usage", []):
+            w.writerow(["model", _safe_cell(m["model"]), m["requests"], m["ok"], m["err"],
+                        m["ptoks"], m["ctoks"], m.get("images", 0), m.get("last_ts") or ""])
+        for k in snap.get("by_key_usage", []):
+            label = names.get(k["key_id"], k["key_id"])
+            w.writerow(["key", _safe_cell(f"{label} ({k['key_id']})"), k["requests"], k["ok"], k["err"],
+                        k["ptoks"], k["ctoks"], k.get("images", 0), k.get("last_ts") or ""])
+        return Response(content=buf.getvalue(), media_type="text/csv", headers={
+            "Content-Disposition": 'attachment; filename="ripgpt-usage.csv"'})
 
     return app
 
@@ -554,6 +921,7 @@ async def _stream_chat_completion(
     base_url: str,
     stop: str | list[str] | None,
     include_usage: bool,
+    key_id: str | None = None,
 ):
     # OpenWebUI and most clients send stream=true. ripgpt's reliable path is the
     # non-streaming browser capture (answer delivered over the WebSocket), so we fetch
@@ -596,8 +964,9 @@ async def _stream_chat_completion(
             chunk_queue = await asyncio.to_thread(SERVICE.stream, prompt, temporary, model_slug)
         except Exception as exc:
             METRICS.record(model_req=model, model_res=model_slug, status="error",
-                           error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
-            yield _delta(f"[Error: {exc}]")
+                           error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
+                           key_id=key_id)
+            yield _delta(f"[Error: {_safe_upstream_error(exc)}]")
             yield "data: [DONE]\n\n"
             return
         parts: list[str] = []
@@ -607,8 +976,9 @@ async def _stream_chat_completion(
                 break
             if isinstance(item, dict) and item.get("error"):
                 METRICS.record(model_req=model, model_res=model_slug, status="error",
-                               error_class=classify_error(str(item["error"])), latency_ms=int((time.time() - t0) * 1000))
-                yield _delta(f"[Error: {item['error']}]")
+                               error_class=classify_error(str(item["error"])), latency_ms=int((time.time() - t0) * 1000),
+                               key_id=key_id)
+                yield _delta(f"[Error: {_safe_upstream_error(item['error'])}]")
                 yield "data: [DONE]\n\n"
                 return
             parts.append(item)
@@ -617,7 +987,7 @@ async def _stream_chat_completion(
         _ok = bool(answer.strip())
         METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
                        error_class=None if _ok else "empty_reply", latency_ms=int((time.time() - t0) * 1000),
-                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer))
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), key_id=key_id)
         for frame in _tail(answer):
             yield frame
         return
@@ -627,13 +997,14 @@ async def _stream_chat_completion(
         answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image, files)
     except Exception as exc:
         METRICS.record(model_req=model, model_res=model_slug, status="error",
-                       error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
+                       error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
+                       key_id=key_id)
         error_chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": created,
             "model": model,
-            "choices": [{"index": 0, "delta": {"content": f"[Error: {exc}]"}, "finish_reason": None}],
+            "choices": [{"index": 0, "delta": {"content": f"[Error: {_safe_upstream_error(exc)}]"}, "finish_reason": None}],
         }
         yield f"data: {json.dumps(error_chunk)}\n\n"
         yield "data: [DONE]\n\n"
@@ -644,7 +1015,8 @@ async def _stream_chat_completion(
     _ok = bool(answer.strip())
     METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
                    error_class=None if _ok else "empty_reply", latency_ms=int((time.time() - t0) * 1000),
-                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img)
+                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img,
+                   key_id=key_id)
     for piece in _chunk_text(answer):
         chunk = {
             "id": completion_id,
@@ -688,19 +1060,21 @@ async def _stream_completion(
     image: bool,
     base_url: str,
     stop: str | list[str] | None,
+    key_id: str | None = None,
 ):
     t0 = time.time()
     try:
         answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image)
     except Exception as exc:
         METRICS.record(model_req=model, model_res=model_slug, status="error",
-                       error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000))
+                       error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
+                       key_id=key_id)
         error_chunk = {
             "id": completion_id,
             "object": "text_completion",
             "created": created,
             "model": model,
-            "choices": [{"text": f"[Error: {exc}]", "index": 0, "logprobs": None, "finish_reason": None}],
+            "choices": [{"text": f"[Error: {_safe_upstream_error(exc)}]", "index": 0, "logprobs": None, "finish_reason": None}],
         }
         yield f"data: {json.dumps(error_chunk)}\n\n"
         yield "data: [DONE]\n\n"
@@ -711,7 +1085,8 @@ async def _stream_completion(
     _ok = bool(answer.strip())
     METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
                    error_class=None if _ok else "empty_reply", latency_ms=int((time.time() - t0) * 1000),
-                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img)
+                   ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img,
+                   key_id=key_id)
     for piece in _iter_markdown_chunks(answer):
         chunk = {
             "id": completion_id,
@@ -741,6 +1116,7 @@ def run() -> None:
 
     port = int(os.environ.get("API_PORT", "8850"))
     log.info("CHATGPT_SESSION_TOKEN=%s", "set" if os.environ.get("CHATGPT_SESSION_TOKEN") else "NOT SET (anonymous mode)")
-    log.info("API_KEY=%s", "set" if os.environ.get("API_KEY") else "NOT SET (auth disabled)")
+    log.info("API_KEY env=%s (seeds the key store)", "set" if os.environ.get("API_KEY") else "NOT SET")
+    log.info("Admin console=%s", "configured" if admin_configured() else "LOCKED (set ADMIN_USER/ADMIN_PASSWORD_HASH)")
     log.info("Starting RipGPT API on port %s", port)
     uvicorn.run(app, host="0.0.0.0", port=port)

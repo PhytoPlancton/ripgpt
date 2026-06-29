@@ -2,7 +2,10 @@ services:
   api:
     build: .
     ports:
-      - "8850:8850"
+      # Bind to localhost only: the Cloudflare Tunnel reaches the API over the compose
+      # network (api:8850), so the host port is just for local testing. Not exposing it on
+      # the LAN prevents bypassing the tunnel to spoof client headers / hit the API direct.
+      - "127.0.0.1:8850:8850"
     environment:
       - API_PORT=8850
       - VERBOSE=true
@@ -13,6 +16,18 @@ services:
       # browser). Local default; on EDJ set PUBLIC_BASE_URL=https://ripgpt.nmt.ovh.
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://localhost:8850}
       - API_KEY=${API_KEY}
+      # Admin console login (required to open the dashboard / manage keys).
+      # Generate the hash with: docker compose exec api python -m app.adminpw
+      - ADMIN_USER=${ADMIN_USER:-}
+      - ADMIN_PASSWORD_HASH=${ADMIN_PASSWORD_HASH:-}
+      # Optional: pin the session-signing secret (else one is generated & persisted on
+      # the profile volume). Set it to keep sessions valid across volume resets.
+      - SESSION_SECRET=${SESSION_SECRET:-}
+      # Set true ONLY when the app is reachable solely through a trusted proxy/tunnel that
+      # overwrites CF-Connecting-IP / X-Forwarded-* (e.g. Cloudflare Tunnel). It enables
+      # per-real-IP login throttling and proxy-derived HTTPS detection. Leave false if the
+      # port can be reached directly (else clients could spoof those headers).
+      - TRUST_PROXY_HEADERS=${TRUST_PROXY_HEADERS:-false}
       - CHATGPT_SESSION_TOKEN=${CHATGPT_SESSION_TOKEN:-}
       - CHATGPT_COOKIES=${CHATGPT_COOKIES:-}
       - INJECT_CF_COOKIES=${INJECT_CF_COOKIES:-false}

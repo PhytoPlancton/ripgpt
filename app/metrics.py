@@ -48,10 +48,13 @@ class Metrics:
         self.started_ts = time.time()
         # Cumulative per-model counters that survive the ring buffer (true all-time).
         self._lifetime: dict[str, dict] = {}
+        # Cumulative per-API-key counters (key_id -> stats), for the admin keys panel.
+        self._by_key: dict[str, dict] = {}
 
     def record(self, *, model_req: str, model_res: str | None, status: str,
                error_class: str | None, latency_ms: int,
-               ptoks: int = 0, ctoks: int = 0, images: int = 0) -> None:
+               ptoks: int = 0, ctoks: int = 0, images: int = 0,
+               key_id: str | None = None) -> None:
         now = time.time()
         mres = model_res or model_req
         rec = {
@@ -67,6 +70,16 @@ class Metrics:
         }
         with self._lock:
             self._recent.append(rec)
+            if key_id:
+                k = self._by_key.setdefault(
+                    key_id, {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
+                             "images": 0, "last_ts": None})
+                k["req"] += 1
+                k["last_ts"] = now
+                k["ptoks"] += int(ptoks)
+                k["ctoks"] += int(ctoks)
+                k["images"] += int(images)
+                k["ok" if status == "ok" else "err"] += 1
             lt = self._lifetime.setdefault(
                 mres, {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
                        "images": 0, "last_ts": None, "lat_sum": 0, "lat_n": 0})
@@ -101,6 +114,7 @@ class Metrics:
             last_ok = self.last_success_ts
             started = self.started_ts
             lifetime = {m: dict(d) for m, d in self._lifetime.items()}
+            by_key = {k: dict(d) for k, d in self._by_key.items()}
 
         last_15 = self._window(recs, 900, now)
         prev_15 = [r for r in recs if now - 1800 <= r["ts"] < now - 900]
@@ -171,9 +185,26 @@ class Metrics:
             for d in sorted(buckets.values(), key=lambda x: x["t"])
         ]
 
+        # cumulative usage per API key (admin keys panel joins id -> name client-side)
+        by_key_usage = []
+        for kid, d in by_key.items():
+            req = d["req"] or 0
+            by_key_usage.append({
+                "key_id": kid,
+                "requests": req,
+                "ok": d["ok"],
+                "err": d["err"],
+                "ptoks": d["ptoks"],
+                "ctoks": d["ctoks"],
+                "images": d.get("images", 0),
+                "last_ts": d["last_ts"],
+            })
+        by_key_usage.sort(key=lambda x: -x["requests"])
+
         recent = list(reversed(recs[-50:]))
         return {
             "now": now,
+            "by_key_usage": by_key_usage,
             "error_rate_15m": err_rate(last_15),
             "error_rate_prev_15m": err_rate(prev_15),
             "req_15m": len(last_15),
