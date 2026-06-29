@@ -222,7 +222,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="tile"><div class="edge" id="t1e"></div><div class="k">Session</div><div class="v" id="t1v">—</div><div class="sub" id="t1s"></div></div>
     <div class="tile"><div class="edge" id="t2e"></div><div class="k">Queue depth</div><div class="v" id="t2v">—</div><div class="sub" id="t2s">in-flight</div></div>
     <div class="tile"><div class="edge" id="t3e"></div><div class="k">Error rate · 15m</div><div class="v" id="t3v">—</div><div class="sub" id="t3s"></div></div>
-    <div class="tile"><div class="edge" id="t4e"></div><div class="k">Wedge risk</div><div class="v" id="t4v">—</div><div class="sub" id="t4s">consecutive empty/timeout</div></div>
+    <div class="tile"><div class="edge" id="t4e"></div><div class="k">Coût API évité</div><div class="v" id="t4v">—</div><div class="sub" id="t4s">total estimé</div></div>
   </div>
 
   <!-- charts -->
@@ -328,9 +328,9 @@ function render(s){
   let ec = er>0.20?'bad':er>0.05?'warn-c':'ok';
   const spike = (prev>0 && er>=2*prev && er>0.05);
   setTile(3, (er*100).toFixed(0)+'%', s.req_15m+' req · '+(spike?'▲ spiking':'prev '+(prev*100).toFixed(0)+'%'), ec);
-  const w=s.consecutive_empty_or_timeout;
-  let wc=w>=3?'bad':w>=2?'warn-c':'ok';
-  setTile(4, w, w>=3?'⚠ back off / cooldown':'healthy', wc);
+  const w=s.consecutive_empty_or_timeout;   // still tracked → drives the wedge banner below
+  const costSaved=(s.lifetime&&s.lifetime.cost)||0;
+  setTile(4, '~'+fmtMoney(costSaved), 'coût API évité · all-time', 'ok');
 
   if(st.session_state==='logged_out') banner('⚠ Session looks LOGGED OUT — refresh CHATGPT_COOKIES and restart. Nothing works until then.','bad');
   else if(st.session_state==='browser_dead') banner('⚠ Browser session is DEAD — hit “restart”.','bad');
