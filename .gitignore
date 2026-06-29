@@ -9,7 +9,14 @@ __pycache__
 .env.local
 edj-env.txt
 deploy-secrets.txt
+edj-stack.yml
+
+# Runtime state / secrets (live on the data volume; ignore if they appear locally)
+.session_secret
+.admin_token_version
+keys.json
+keys.json.tmp
 
 # Backups & logs
 *.bak
-*.logedj-stack.yml
+*.log
