@@ -28,6 +28,14 @@ services:
       # per-real-IP login throttling and proxy-derived HTTPS detection. Leave false if the
       # port can be reached directly (else clients could spoof those headers).
       - TRUST_PROXY_HEADERS=${TRUST_PROXY_HEADERS:-false}
+      # Ban protection: paces /v1 turns so a runaway client can't hammer the ChatGPT
+      # account (rolling caps) and auto-cools-down when ChatGPT starts throttling.
+      - RATE_PER_MIN=${RATE_PER_MIN:-20}
+      - RATE_PER_HOUR=${RATE_PER_HOUR:-300}
+      - RATE_PER_DAY=${RATE_PER_DAY:-2000}
+      - RATE_MIN_INTERVAL_S=${RATE_MIN_INTERVAL_S:-0}
+      - RATE_BREAKER_THRESHOLD=${RATE_BREAKER_THRESHOLD:-4}
+      - RATE_BREAKER_COOLDOWN_S=${RATE_BREAKER_COOLDOWN_S:-600}
       - CHATGPT_SESSION_TOKEN=${CHATGPT_SESSION_TOKEN:-}
       - CHATGPT_COOKIES=${CHATGPT_COOKIES:-}
       - INJECT_CF_COOKIES=${INJECT_CF_COOKIES:-false}

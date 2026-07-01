@@ -19,6 +19,7 @@ from app.metrics import METRICS, classify_error
 from app.dashboard import DASHBOARD_HTML, LOGIN_HTML, SETUP_HTML
 from app.imagestore import IMAGES, ext_for
 from app.keystore import KEYS
+from app.ratelimit import RATE
 from app import auth
 from app.auth import (
     SESSION_COOKIE, CSRF_COOKIE, SESSION_TTL,
@@ -71,6 +72,20 @@ def _queue_overloaded() -> bool:
         return SERVICE.queue_depth() >= MAX_QUEUE_DEPTH
     except Exception:
         return False
+
+
+def _rate_limited_response(retry_after: int, reason: str):
+    # Ban-protection: over a cap → 429; in an anti-ban cooldown → 503. Both carry Retry-After
+    # so a well-behaved client (e.g. examples/batch.py) backs off instead of hammering ChatGPT.
+    if reason == "cooldown":
+        status, code, etype = 503, "cooldown", "server_error"
+        msg = f"Anti-ban cooldown active — retry after {retry_after}s."
+    else:
+        status, code, etype = 429, "rate_limited", "invalid_request_error"
+        msg = f"Rate limit ({reason}) — retry after {retry_after}s."
+    return JSONResponse(status_code=status,
+                        content={"error": {"message": msg, "type": etype, "code": code}},
+                        headers={"Retry-After": str(retry_after)})
 
 
 def _bearer(request: Request) -> str:
@@ -573,6 +588,9 @@ def create_app() -> FastAPI:
             return _error_response("Proxy is paused.", status_code=503, error_type="server_error", code="paused")
         if _queue_overloaded():
             return _overloaded_response()
+        _rl_ok, _rl_wait, _rl_reason = RATE.allow()
+        if not _rl_ok:
+            return _rate_limited_response(_rl_wait, _rl_reason)
 
         if payload.stream:
             return StreamingResponse(
@@ -635,6 +653,9 @@ def create_app() -> FastAPI:
             return _error_response("Proxy is paused.", status_code=503, error_type="server_error", code="paused")
         if _queue_overloaded():
             return _overloaded_response()
+        _rl_ok, _rl_wait, _rl_reason = RATE.allow()
+        if not _rl_ok:
+            return _rate_limited_response(_rl_wait, _rl_reason)
 
         if payload.stream:
             return StreamingResponse(
@@ -761,6 +782,7 @@ def create_app() -> FastAPI:
         _require_admin(request)
         snap = METRICS.snapshot()
         snap["live"] = SERVICE.live_state()
+        snap["rate"] = RATE.snapshot()
         return snap
 
     @app.post("/admin/restart-session")
@@ -858,6 +880,9 @@ def create_app() -> FastAPI:
         if SERVICE.is_paused():
             return _error_response("Proxy is paused.", status_code=503,
                                    error_type="server_error", code="paused")
+        _rl_ok, _rl_wait, _rl_reason = RATE.allow()
+        if not _rl_ok:
+            return _rate_limited_response(_rl_wait, _rl_reason)
         temporary, slug, image = _model_config(resolved, prompt)
         t0 = time.time()
         try:

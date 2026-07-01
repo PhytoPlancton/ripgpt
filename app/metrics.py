@@ -14,6 +14,7 @@ import time
 from collections import deque
 
 from app import pricing
+from app import ratelimit
 
 # Error taxonomy surfaced on the dashboard.
 ERROR_CLASSES = ("empty_reply", "composer_timeout", "logged_out", "http_500", "nav_error", "timeout", "other")
@@ -160,6 +161,11 @@ class Metrics:
             # Throttled persist so a restart keeps all-time usage/cost.
             if now - self._last_persist >= _PERSIST_INTERVAL:
                 self._save_locked()
+        # Outside the lock: feed the ban-protection circuit breaker with this turn's outcome.
+        try:
+            ratelimit.RATE.note_result(status == "ok", error_class)
+        except Exception:
+            pass
 
     def _window(self, recs: list, seconds: float, now: float) -> list:
         cutoff = now - seconds

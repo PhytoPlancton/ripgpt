@@ -204,6 +204,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="logo"><span class="pirate">🏴‍☠️</span> <b>ripgpt</b> · console</div>
     <span class="spacer"></span>
     <span class="pill" id="clock">—</span>
+    <span class="pill" id="ratePill" title="protection anti-ban : requêtes acceptées aujourd'hui">—</span>
     <span class="pill" id="pausePill" style="display:none">⏸ polling paused (tab hidden)</span>
     <a href="/admin/usage.csv"><button title="Download usage CSV">⭳ CSV</button></a>
     <button id="restartBtn" class="warn" title="Recreate the browser session">⟳ restart</button>
@@ -332,9 +333,13 @@ function render(s){
   const costSaved=(s.lifetime&&s.lifetime.cost)||0;
   setTile(4, '~'+fmtMoney(costSaved), 'coût API évité · all-time', 'ok');
 
+  const rate = s.rate || {};
+  if(rate.per_day){ $('ratePill').textContent = '🛡 '+rate.per_day.used+'/'+(rate.per_day.cap||'∞')+' /j'; }
   if(st.session_state==='logged_out') banner('⚠ Session looks LOGGED OUT — refresh CHATGPT_COOKIES and restart. Nothing works until then.','bad');
   else if(st.session_state==='browser_dead') banner('⚠ Browser session is DEAD — hit “restart”.','bad');
+  else if(rate.cooldown_active) banner('🛡 Protection anti-ban : COOLDOWN actif ('+rate.cooldown_remaining_s+'s) — requêtes en pause pour laisser le compte ChatGPT respirer.','warn');
   else if(w>=3) banner('⚠ Possible rate-limit WEDGE ('+w+' empty/timeout in a row) — back off / pause sending.','bad');
+  else if(rate.per_day && rate.per_day.cap && rate.per_day.used >= 0.8*rate.per_day.cap) banner('⚠ Proche de la limite quotidienne anti-ban ('+rate.per_day.used+'/'+rate.per_day.cap+').','warn');
   else if(er>0.20) banner('Error rate high ('+(er*100).toFixed(0)+'% over 15m).','warn');
   else if(spike) banner('Error rate spiking vs previous window.','warn');
   else banner(null);
