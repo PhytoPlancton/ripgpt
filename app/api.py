@@ -20,13 +20,14 @@ from app.dashboard import DASHBOARD_HTML, LOGIN_HTML, SETUP_HTML
 from app.imagestore import IMAGES, ext_for
 from app.keystore import KEYS
 from app.ratelimit import RATE
+from app.settings import SETTINGS
 from app import auth
 from app.auth import (
     SESSION_COOKIE, CSRF_COOKIE, SESSION_TTL,
     admin_configured, check_login, make_session, read_session,
     issue_csrf, verify_csrf, client_ip, cookie_secure,
     login_locked, record_login_fail, reset_login_fails,
-    bump_token_version,
+    bump_token_version, set_admin_password,
 )
 from app.openai_models import (
     ChatCompletionRequest,
@@ -55,9 +56,6 @@ MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(160 * 1024 * 1024)))
 # Admission control: a single browser serves all turns serially, so an unbounded queue
 # lets one caller starve everyone for minutes. Shed load with 503 + Retry-After once the
 # backlog is this deep.
-MAX_QUEUE_DEPTH = int(os.environ.get("MAX_QUEUE_DEPTH", "12"))
-
-
 def _overloaded_response():
     return JSONResponse(
         status_code=503,
@@ -69,7 +67,7 @@ def _overloaded_response():
 
 def _queue_overloaded() -> bool:
     try:
-        return SERVICE.queue_depth() >= MAX_QUEUE_DEPTH
+        return SERVICE.queue_depth() >= SETTINGS.get("max_queue_depth")
     except Exception:
         return False
 
@@ -86,6 +84,13 @@ def _rate_limited_response(retry_after: int, reason: str):
     return JSONResponse(status_code=status,
                         content={"error": {"message": msg, "type": etype, "code": code}},
                         headers={"Retry-After": str(retry_after)})
+
+
+try:
+    with open(os.path.join(os.path.dirname(__file__), "vendor", "chart.umd.min.js"), encoding="utf-8") as _cf:
+        _CHARTJS_SRC = _cf.read()
+except Exception:
+    _CHARTJS_SRC = ""
 
 
 def _bearer(request: Request) -> str:
@@ -197,11 +202,21 @@ def _error_response(message: str, status_code: int = 400, error_type: str = "inv
     return JSONResponse(status_code=status_code, content={"error": error})
 
 
+_CSP = (
+    "default-src 'none'; "
+    "script-src 'self' 'unsafe-inline'; "     # chart.js is vendored at /vendor/chart.js (same origin)
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' https: data:; "
+    "connect-src 'self'; "                    # fetch() only to our own origin — no exfiltration
+    "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+)
+
+
 def _html(content: str, status_code: int = 200):
-    # Frame-protection so the admin console can't be clickjacked, plus a tight referrer.
+    # Clickjacking + tight CSP (no external script/connect origins) on the admin origin.
     return HTMLResponse(content, status_code=status_code, headers={
         "X-Frame-Options": "DENY",
-        "Content-Security-Policy": "frame-ancestors 'none'",
+        "Content-Security-Policy": _CSP,
         "Referrer-Policy": "no-referrer",
     })
 
@@ -418,6 +433,7 @@ async def _lifespan(_: FastAPI):
     # Seed the legacy single API_KEY into the multi-key store so existing integrations
     # keep working; thereafter keys are managed from the admin console.
     KEYS.seed_from_env(API_KEY)
+    SETTINGS.seed_from_env()
     if not KEYS.list():
         log.warning("No API keys configured — ALL /v1 requests will be rejected (401). "
                     "Set API_KEY in .env to seed one, or create keys in the admin console.")
@@ -698,6 +714,12 @@ def create_app() -> FastAPI:
     async def health():
         return {"status": "ok", "session_ready": SERVICE.is_ready()}
 
+    @app.get("/vendor/chart.js")
+    async def vendor_chartjs():
+        # Chart.js served from our own origin (vendored) so the admin console needs no CDN.
+        return Response(content=_CHARTJS_SRC, media_type="application/javascript",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
     @app.get("/images/{iid}")
     async def get_image(iid: str):
         # No API key: an <img> tag can't send Authorization headers. The 32-char
@@ -856,6 +878,52 @@ def create_app() -> FastAPI:
                                    error_type="invalid_request_error", code="model_not_found")
         KEYS.set_model_disabled(model, not enabled)
         return {"model": model, "enabled": enabled}
+
+    # ── runtime settings (rate governor / admission), editable from the UI ──────
+    @app.get("/admin/settings")
+    async def admin_settings_get(request: Request):
+        _require_admin(request)
+        return {"values": SETTINGS.all(), "bounds": SETTINGS.bounds()}
+
+    @app.post("/admin/settings")
+    async def admin_settings_set(request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        applied, errors = SETTINGS.update(body if isinstance(body, dict) else {})
+        if errors:
+            return _error_response("; ".join(errors), status_code=400,
+                                   error_type="invalid_request_error", code="invalid_settings")
+        return {"values": applied}
+
+    # ── change admin password from the UI ──────────────────────────────────────
+    @app.post("/admin/password")
+    async def admin_password(request: Request):
+        uid = _require_admin(request)
+        _check_csrf(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        current = str(body.get("current_password", ""))
+        new_pw = str(body.get("new_password", ""))
+        new_user = str(body.get("username", "")).strip() or None
+        # Verify the CURRENT password against the live hash (generic error, no field disclosure).
+        if not check_login(uid, current):
+            return _error_response("Current password is incorrect.", status_code=403,
+                                   error_type="invalid_request_error", code="bad_credentials")
+        if len(new_pw) < 8:
+            return _error_response("New password must be at least 8 characters.", status_code=400,
+                                   error_type="invalid_request_error", code="weak_password")
+        set_admin_password(new_pw, new_user)   # persists override + bumps token_version
+        # Drop cookies so the admin re-authenticates with the new password.
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(SESSION_COOKIE, path="/")
+        resp.delete_cookie(CSRF_COOKIE, path="/")
+        return resp
 
     # ── test prompt from the console ───────────────────────────────────────────
     @app.post("/admin/test")

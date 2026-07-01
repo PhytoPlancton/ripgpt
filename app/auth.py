@@ -25,6 +25,8 @@ import secrets
 import threading
 import time
 
+from app.settings import SETTINGS
+
 SESSION_COOKIE = "ripgpt_admin"
 CSRF_COOKIE = "ripgpt_csrf"
 CSRF_HEADER = "x-csrf-token"
@@ -109,18 +111,38 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
+def _live_creds() -> tuple[str, str]:
+    """Admin creds with the persisted (UI-set) override winning over the env fallback."""
+    u, h = SETTINGS.admin_creds()
+    return (u or ADMIN_USER), (h or ADMIN_PASSWORD_HASH)
+
+
 def admin_configured() -> bool:
-    return bool(ADMIN_USER and ADMIN_PASSWORD_HASH)
+    u, h = _live_creds()
+    return bool(u and h)
 
 
 def check_login(user: str, password: str) -> bool:
-    if not admin_configured():
-        return False
-    # Compare both fields in constant time; evaluate the password hash regardless of the
-    # username result so timing doesn't reveal whether the username was correct.
-    user_ok = hmac.compare_digest((user or "").strip(), ADMIN_USER)
-    pass_ok = verify_password(password or "", ADMIN_PASSWORD_HASH)
-    return user_ok and pass_ok
+    try:
+        u, h = _live_creds()
+        if not (u and h):
+            return False
+        # Compare on UTF-8 BYTES: hmac.compare_digest raises on non-ASCII str, so an accented
+        # username (e.g. "café") would otherwise 500 the login and lock the admin out. Still
+        # evaluate the password hash regardless of the username result (constant-time-ish).
+        user_ok = hmac.compare_digest((user or "").strip().encode("utf-8"), (u or "").strip().encode("utf-8"))
+        pass_ok = verify_password(password or "", h)
+        return user_ok and pass_ok
+    except Exception:
+        return False   # fail closed — never raise into the login/password endpoints
+
+
+def set_admin_password(new_pw: str, username: str | None = None) -> None:
+    """Persist a new admin password (hash) as the override, and force a global re-login."""
+    h = hash_password(new_pw)                 # PBKDF2, "."-separated (compose-safe)
+    cur_user, _ = _live_creds()
+    SETTINGS.set_admin(username or cur_user, h)
+    bump_token_version()                      # invalidate every outstanding session
 
 
 # ── token_version (global logout) ────────────────────────────────────────────
