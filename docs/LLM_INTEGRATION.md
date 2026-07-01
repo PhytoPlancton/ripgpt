@@ -275,6 +275,31 @@ curl https://ripgpt.nmt.ovh/v1/chat/completions \
 
 ---
 
+## 16. Débit à grande échelle : le BATCHING (levier n°1)
+
+Le backend est **un seul navigateur sérialisé** → 1 appel = 1 tour = quelques secondes. Ne fais
+**pas** 1 appel par item. Mets **M items dans un seul appel** et demande un tableau JSON en retour :
+ça multiplie le débit effectif par ~15-30 sans rien changer au proxy.
+
+```
+Applique cette tâche à chaque item. Réponds UNIQUEMENT par un tableau JSON
+[{"i": <index>, "text": "<résultat>"}], un objet par item, mêmes index, sans texte autour.
+TASK: <ton instruction>
+ITEMS: [{"i":0,"item":{...}}, {"i":1,"item":{...}}, ...]
+```
+
+Bonnes pratiques : `M` ≈ 20-30 (au-delà, risque de troncature / timeout 300 s) ; **indexe** les items
+et **re-demande uniquement les index manquants** (le modèle en oublie/réordonne parfois) ; garde la
+**concurrence = 1** ; backoff sur 429/503.
+
+Un outil prêt à l'emploi est fourni : **[`examples/batch.py`](../examples/batch.py)** (prend un JSON/CSV
+d'items + une instruction, gère le découpage, le parsing tolérant, les passes de réparation et le
+backoff). Ex : `python batch.py --input prospects.json --output out.json --instruction "..." --batch-size 25`.
+
+Ordre de grandeur : 1 compte, sans batching ≈ 1 000-3 000 items/jour ; **avec batching ≈ 20 000-50 000/jour**.
+Pour aller au-delà : plusieurs comptes ChatGPT (1 navigateur/compte) — scaling ~linéaire mais zone grise CGU
++ ~3-6 navigateurs max par machine. ripgpt ne pourra **jamais** égaler la concurrence élastique de l'API payante.
+
 ## 15. Résumé à coller dans le contexte système de ton IA
 
 ```
