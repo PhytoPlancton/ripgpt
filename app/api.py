@@ -712,7 +712,9 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        return {"status": "ok", "session_ready": SERVICE.is_ready()}
+        ok = SERVICE.health_ok()
+        body = {"status": "ok" if ok else "degraded", "session_ready": SERVICE.is_ready()}
+        return JSONResponse(body, status_code=200 if ok else 503)
 
     @app.get("/vendor/chart.js")
     async def vendor_chartjs():

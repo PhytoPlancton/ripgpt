@@ -1043,7 +1043,7 @@ class ChatSession:
         raise RuntimeError(f"File upload did not complete in {int(FILE_UPLOAD_TIMEOUT)}s "
                            f"(attachments not ready) — not sending.")
 
-    def ask(self, question, model_slug=None, image=False, files=None):
+    def ask(self, question, model_slug=None, image=False, files=None, answer_timeout=None):
         # Re-inject interceptors in case page JS replaced window.fetch / WebSocket
         self._page.evaluate(FETCH_INTERCEPT_JS)
         self._page.evaluate(RESET_SSE_JS)
@@ -1062,8 +1062,12 @@ class ChatSession:
         self._page.keyboard.insert_text(question)
         time.sleep(0.3)
         self._page.keyboard.press("Enter")
+        natural = FILE_ANSWER_TIMEOUT if files else ANSWER_TIMEOUT
+        # answer_timeout caps how long we wait (e.g. under the Cloudflare 100s edge timeout);
+        # it's a CEILING, never longer than the natural per-turn budget.
+        eff = min(natural, answer_timeout) if answer_timeout else natural
         return _wait_for_answer(self._page, image=image, files=bool(files), baseline=baseline,
-                                timeout=FILE_ANSWER_TIMEOUT if files else None)
+                                timeout=eff)
 
     def send(self, question, model_slug=None, image=False, files=None):
         """Type and send a question without waiting for the answer."""

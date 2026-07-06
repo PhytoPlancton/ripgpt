@@ -23,6 +23,21 @@ SESSION_CHECK_INTERVAL = int(os.environ.get("SESSION_CHECK_INTERVAL", "900"))
 FILE_TURN_TIMEOUT = int(os.environ.get("FILE_TURN_TIMEOUT", "840"))
 DEFAULT_TURN_TIMEOUT = 330
 
+# Hard ceiling on how long a SINGLE turn may occupy the browser (seconds). Kept UNDER the
+# Cloudflare edge timeout (~100s) so a slow turn returns a clean error instead of a 524 —
+# and so one stuck turn can't hog the single serialized browser. Raise it only for direct
+# (non-tunnel) access where long file turns are needed.
+TURN_HARD_TIMEOUT = float(os.environ.get("TURN_HARD_TIMEOUT", "85"))
+
+# Watchdog: if a turn stays in-flight far past its cap, the browser is genuinely hung (e.g. a
+# frozen page.evaluate, which has no native timeout). SOFT → flag degraded + enqueue a restart;
+# HARD → exit the process so Docker (restart: unless-stopped) brings up a fresh browser.
+WATCHDOG_INTERVAL = float(os.environ.get("WATCHDOG_INTERVAL", "10"))
+WATCHDOG_SOFT_S = float(os.environ.get("WATCHDOG_SOFT_S", "130"))
+WATCHDOG_HARD_S = float(os.environ.get("WATCHDOG_HARD_S", "200"))
+WATCHDOG_HARD_EXIT = (os.environ.get("WATCHDOG_HARD_EXIT", "true").strip().lower()
+                      in ("1", "true", "yes", "on"))
+
 
 @dataclass(slots=True)
 class SessionRequest:
@@ -51,6 +66,8 @@ class BrowserSessionService:
         self._restart_count = 0
         self._in_flight: dict | None = None
         self._paused = False
+        self._degraded = False
+        self._watchdog: threading.Thread | None = None
 
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -60,12 +77,48 @@ class BrowserSessionService:
         self._ready.clear()
         self._worker = threading.Thread(target=self._worker_loop, name="ripgpt-browser", daemon=True)
         self._worker.start()
+        if not (self._watchdog and self._watchdog.is_alive()):
+            self._watchdog = threading.Thread(target=self._watchdog_loop, name="ripgpt-watchdog", daemon=True)
+            self._watchdog.start()
 
     def wait_until_ready(self, timeout: float | None = None) -> bool:
         return self._ready.wait(timeout or self._startup_timeout)
 
     def is_ready(self) -> bool:
         return self._ready.is_set() and self._startup_error is None
+
+    def health_ok(self) -> bool:
+        """Liveness for /health: ready, no startup error, and not watchdog-degraded."""
+        return self.is_ready() and not self._degraded
+
+    def _safe_enqueue_restart(self) -> None:
+        try:
+            self._request_queue.put(SessionRequest(prompt="", temporary=False, holder={},
+                                                   done_event=threading.Event(), control="restart"))
+        except Exception:
+            pass
+
+    def _watchdog_loop(self) -> None:
+        """Detect a turn stuck far past its cap (a hard browser hang) and recover."""
+        while True:
+            time.sleep(WATCHDOG_INTERVAL)
+            inf = self._in_flight
+            if not inf:
+                self._degraded = False
+                continue
+            age = time.time() - inf.get("started", time.time())
+            if age > WATCHDOG_HARD_S:
+                logger.critical("Watchdog: turn stuck %.0fs (>%.0fs) — browser hard-hung; %s",
+                                age, WATCHDOG_HARD_S,
+                                "exiting for container restart" if WATCHDOG_HARD_EXIT else "enqueuing restart")
+                if WATCHDOG_HARD_EXIT:
+                    os._exit(1)   # Docker restart: unless-stopped recreates a fresh browser
+                self._safe_enqueue_restart()
+            elif age > WATCHDOG_SOFT_S and not self._degraded:
+                self._degraded = True
+                logger.warning("Watchdog: turn stuck %.0fs (>%.0fs) — degraded, enqueuing restart.",
+                               age, WATCHDOG_SOFT_S)
+                self._safe_enqueue_restart()
 
     # ── monitoring / control ──────────────────────────────────────────────
     def queue_depth(self) -> int:
@@ -107,6 +160,7 @@ class BrowserSessionService:
             "browser_uptime_s": round(now - self._browser_start_ts) if self._browser_start_ts else None,
             "restart_count": self._restart_count,
             "paused": self._paused,
+            "degraded": self._degraded,
         }
 
     def _do_restart(self) -> None:
@@ -137,7 +191,9 @@ class BrowserSessionService:
             self._stream_answer_via_dom(page, request.holder, baseline=baseline)
         else:
             assert isinstance(request.holder, dict)
-            request.holder["answer"] = self._session.ask(request.prompt, request.model_slug, image=request.image, files=request.files)
+            request.holder["answer"] = self._session.ask(
+                request.prompt, request.model_slug, image=request.image, files=request.files,
+                answer_timeout=TURN_HARD_TIMEOUT)
 
     def _put_error(self, request: "SessionRequest", exc: Exception) -> None:
         if request.stream:
@@ -306,7 +362,7 @@ class BrowserSessionService:
     def _stream_answer_via_dom(self, page, chunk_queue: queue.Queue, baseline: str = "") -> None:
         sent = ""
         previous_safe = ""
-        deadline = time.time() + browser.ANSWER_TIMEOUT
+        deadline = time.time() + min(browser.ANSWER_TIMEOUT, TURN_HARD_TIMEOUT)
         last_markdown = ""
         last_change = time.time()
         started = False

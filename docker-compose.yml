@@ -36,6 +36,13 @@ services:
       - RATE_MIN_INTERVAL_S=${RATE_MIN_INTERVAL_S:-0}
       - RATE_BREAKER_THRESHOLD=${RATE_BREAKER_THRESHOLD:-4}
       - RATE_BREAKER_COOLDOWN_S=${RATE_BREAKER_COOLDOWN_S:-600}
+      # Per-turn hard cap (< Cloudflare's ~100s edge timeout) so a slow/stuck turn returns
+      # a clean error instead of a 524 and can't hog the single browser. Watchdog auto-
+      # restarts the container if a turn hard-hangs (needs restart: unless-stopped, set below).
+      - TURN_HARD_TIMEOUT=${TURN_HARD_TIMEOUT:-85}
+      - WATCHDOG_SOFT_S=${WATCHDOG_SOFT_S:-130}
+      - WATCHDOG_HARD_S=${WATCHDOG_HARD_S:-200}
+      - WATCHDOG_HARD_EXIT=${WATCHDOG_HARD_EXIT:-true}
       - CHATGPT_SESSION_TOKEN=${CHATGPT_SESSION_TOKEN:-}
       - CHATGPT_COOKIES=${CHATGPT_COOKIES:-}
       - INJECT_CF_COOKIES=${INJECT_CF_COOKIES:-false}
