@@ -47,6 +47,15 @@ services:
       # next one (fixes cross-wired/empty answers when a client fires many rapid one-shot
       # prompts). Set false to reuse one chat (faster, but answers can cross-wire).
       - FRESH_TEMPORARY_CHAT=${FRESH_TEMPORARY_CHAT:-true}
+      # Multi-account pool: POOL_SIZE ChatGPT accounts behind ONE ripgpt API key. Slot 0 uses
+      # the CHATGPT_* above; slots 1..N use CHATGPT_SESSION_TOKEN_i / CHATGPT_COOKIES_i and get
+      # their own profile subdir on the same volume. ⚠ Same-IP multi-account raises ban risk.
+      - POOL_SIZE=${POOL_SIZE:-1}
+      - POOL_STARTUP_STAGGER_S=${POOL_STARTUP_STAGGER_S:-5}
+      - CHATGPT_SESSION_TOKEN_1=${CHATGPT_SESSION_TOKEN_1:-}
+      - CHATGPT_COOKIES_1=${CHATGPT_COOKIES_1:-}
+      - CHATGPT_SESSION_TOKEN_2=${CHATGPT_SESSION_TOKEN_2:-}
+      - CHATGPT_COOKIES_2=${CHATGPT_COOKIES_2:-}
       - CHATGPT_SESSION_TOKEN=${CHATGPT_SESSION_TOKEN:-}
       - CHATGPT_COOKIES=${CHATGPT_COOKIES:-}
       - INJECT_CF_COOKIES=${INJECT_CF_COOKIES:-false}

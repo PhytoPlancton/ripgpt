@@ -15,37 +15,67 @@ from . import ratelimit
 logger = logging.getLogger("ripgpt.session")
 
 # How often (in seconds) to verify the ChatGPT session is still active.
-# Defaults to 15 minutes; override via SESSION_CHECK_INTERVAL env var.
 SESSION_CHECK_INTERVAL = int(os.environ.get("SESSION_CHECK_INTERVAL", "900"))
 
 # File turns (upload + ChatGPT ingest of large docs) can take minutes — longer budget.
-# Must exceed browser FILE_UPLOAD_TIMEOUT(180) + FILE_ANSWER_TIMEOUT(540) so the client
-# wait never expires while the worker is still legitimately processing.
 FILE_TURN_TIMEOUT = int(os.environ.get("FILE_TURN_TIMEOUT", "840"))
 DEFAULT_TURN_TIMEOUT = 330
 
 # Hard ceiling on how long a SINGLE turn may occupy the browser (seconds). Kept UNDER the
 # Cloudflare edge timeout (~100s) so a slow turn returns a clean error instead of a 524 —
-# and so one stuck turn can't hog the single serialized browser. Raise it only for direct
-# (non-tunnel) access where long file turns are needed.
+# and so one stuck turn can't hog a worker. Raise only for direct (non-tunnel) access.
 TURN_HARD_TIMEOUT = float(os.environ.get("TURN_HARD_TIMEOUT", "85"))
 
 # Watchdog: if a turn stays in-flight far past its cap, the browser is genuinely hung (e.g. a
 # frozen page.evaluate, which has no native timeout). SOFT → flag degraded + enqueue a restart;
-# HARD → exit the process so Docker (restart: unless-stopped) brings up a fresh browser.
+# HARD → exit the process so Docker (restart: unless-stopped) brings up fresh browsers.
 WATCHDOG_INTERVAL = float(os.environ.get("WATCHDOG_INTERVAL", "10"))
 WATCHDOG_SOFT_S = float(os.environ.get("WATCHDOG_SOFT_S", "130"))
 WATCHDOG_HARD_S = float(os.environ.get("WATCHDOG_HARD_S", "200"))
 WATCHDOG_HARD_EXIT = (os.environ.get("WATCHDOG_HARD_EXIT", "true").strip().lower()
                       in ("1", "true", "yes", "on"))
 
-# Reusing ONE temporary chat across turns lets a previous turn's answer leak into the next
-# (baseline race → cross-wired / empty answers when a client fires many rapid one-shot prompts,
-# e.g. classify + generate + variants — exactly tailr's pattern). Those calls are stateless, so
-# by default start a FRESH temporary chat every turn: correctness over the small reload cost.
-# Set FRESH_TEMPORARY_CHAT=false to restore reuse (faster, but answers can cross-wire).
+# Start a fresh temporary chat per turn (default) so a prior turn's answer can't leak into the
+# next one. Set FRESH_TEMPORARY_CHAT=false to restore reuse (faster, but answers can cross-wire).
 FRESH_TEMPORARY_CHAT = (os.environ.get("FRESH_TEMPORARY_CHAT", "true").strip().lower()
                         in ("1", "true", "yes", "on"))
+
+# ── Multi-account pool ─────────────────────────────────────────────────────────
+# Number of ChatGPT accounts (each = its own browser + profile + cookies) served behind ONE
+# ripgpt API key. POOL_SIZE=1 (default) is the exact single-account behaviour. Each extra slot
+# i reads CHATGPT_SESSION_TOKEN_i / CHATGPT_COOKIES_i and gets its own profile dir "<base>/sloti".
+# ⚠ Same-IP multi-account raises ban-in-a-cluster risk — pace conservatively (rate governor).
+POOL_SIZE = max(1, min(8, int(os.environ.get("POOL_SIZE", "1") or "1")))
+# Stagger worker startup so N browsers don't all hit chatgpt.com at the same instant (same IP).
+POOL_STARTUP_STAGGER_S = float(os.environ.get("POOL_STARTUP_STAGGER_S", "5"))
+
+
+def _worker_config(i: int) -> tuple[str, str, str]:
+    """(profile_dir, session_token, cookies) for pool slot i. Slot 0 == the current account."""
+    if i == 0:
+        return (browser.BROWSER_PROFILE_DIR, browser.CHATGPT_SESSION_TOKEN, browser.CHATGPT_COOKIES)
+    base = browser.BROWSER_PROFILE_DIR or "/data/profile"
+    return (
+        os.path.join(base, f"slot{i}"),
+        os.environ.get(f"CHATGPT_SESSION_TOKEN_{i}", "").strip(),
+        os.environ.get(f"CHATGPT_COOKIES_{i}", "").strip(),
+    )
+
+
+class Worker:
+    """One ChatGPT account: its own browser session, thread, and health state."""
+
+    def __init__(self, wid: int, profile_dir: str, session_token: str, cookies: str):
+        self.id = wid
+        self.profile_dir = profile_dir
+        self.session_token = session_token
+        self.cookies = cookies
+        self.session: browser.ChatSession | None = None
+        self.in_flight: dict | None = None
+        self.browser_start_ts: float | None = None
+        self.restart_count = 0
+        self.startup_error: Exception | None = None
+        self.ready = threading.Event()
 
 
 @dataclass(slots=True)
@@ -64,70 +94,42 @@ class SessionRequest:
 class BrowserSessionService:
     def __init__(self, startup_timeout: float = 300.0):
         self._startup_timeout = startup_timeout
-        self._session: browser.ChatSession | None = None
         self._request_queue: queue.Queue[SessionRequest | None] = queue.Queue()
-        self._ready = threading.Event()
-        self._worker: threading.Thread | None = None
-        self._startup_error: Exception | None = None
-        # ── monitoring state ──
+        self._threads: list[threading.Thread] = []
+        self._watchdog: threading.Thread | None = None
         self._proxy_start_ts = time.time()
-        self._browser_start_ts: float | None = None
-        self._restart_count = 0
-        self._in_flight: dict | None = None
         self._paused = False
         self._degraded = False
-        self._watchdog: threading.Thread | None = None
+        self._workers: list[Worker] = [Worker(i, *_worker_config(i)) for i in range(POOL_SIZE)]
 
     def start(self) -> None:
-        if self._worker and self._worker.is_alive():
+        if self._threads and any(t.is_alive() for t in self._threads):
             return
-
-        self._startup_error = None
-        self._ready.clear()
-        self._worker = threading.Thread(target=self._worker_loop, name="ripgpt-browser", daemon=True)
-        self._worker.start()
+        self._threads = []
+        for w in self._workers:
+            w.ready.clear()
+            w.startup_error = None
+            t = threading.Thread(target=self._worker_loop, args=(w,),
+                                 name=f"ripgpt-browser-{w.id}", daemon=True)
+            t.start()
+            self._threads.append(t)
         if not (self._watchdog and self._watchdog.is_alive()):
             self._watchdog = threading.Thread(target=self._watchdog_loop, name="ripgpt-watchdog", daemon=True)
             self._watchdog.start()
 
     def wait_until_ready(self, timeout: float | None = None) -> bool:
-        return self._ready.wait(timeout or self._startup_timeout)
+        deadline = time.time() + (timeout or self._startup_timeout)
+        for w in self._workers:
+            w.ready.wait(max(0.0, deadline - time.time()))
+        return self.is_ready()
 
     def is_ready(self) -> bool:
-        return self._ready.is_set() and self._startup_error is None
+        return any(w.ready.is_set() and w.startup_error is None and w.session is not None
+                   for w in self._workers)
 
     def health_ok(self) -> bool:
-        """Liveness for /health: ready, no startup error, and not watchdog-degraded."""
+        """Liveness for /health: at least one worker ready, and not watchdog-degraded."""
         return self.is_ready() and not self._degraded
-
-    def _safe_enqueue_restart(self) -> None:
-        try:
-            self._request_queue.put(SessionRequest(prompt="", temporary=False, holder={},
-                                                   done_event=threading.Event(), control="restart"))
-        except Exception:
-            pass
-
-    def _watchdog_loop(self) -> None:
-        """Detect a turn stuck far past its cap (a hard browser hang) and recover."""
-        while True:
-            time.sleep(WATCHDOG_INTERVAL)
-            inf = self._in_flight
-            if not inf:
-                self._degraded = False
-                continue
-            age = time.time() - inf.get("started", time.time())
-            if age > WATCHDOG_HARD_S:
-                logger.critical("Watchdog: turn stuck %.0fs (>%.0fs) — browser hard-hung; %s",
-                                age, WATCHDOG_HARD_S,
-                                "exiting for container restart" if WATCHDOG_HARD_EXIT else "enqueuing restart")
-                if WATCHDOG_HARD_EXIT:
-                    os._exit(1)   # Docker restart: unless-stopped recreates a fresh browser
-                self._safe_enqueue_restart()
-            elif age > WATCHDOG_SOFT_S and not self._degraded:
-                self._degraded = True
-                logger.warning("Watchdog: turn stuck %.0fs (>%.0fs) — degraded, enqueuing restart.",
-                               age, WATCHDOG_SOFT_S)
-                self._safe_enqueue_restart()
 
     # ── monitoring / control ──────────────────────────────────────────────
     def queue_depth(self) -> int:
@@ -139,68 +141,106 @@ class BrowserSessionService:
     def set_paused(self, value: bool) -> None:
         self._paused = bool(value)
 
-    def request_restart(self, timeout: float = 120) -> bool:
-        """Ask the worker to recreate the browser session (one-click recovery)."""
-        self._ensure_ready()
-        done = threading.Event()
-        self._request_queue.put(SessionRequest(prompt="", temporary=False, holder={}, done_event=done, control="restart"))
-        return done.wait(timeout)
+    def _safe_enqueue_restart(self) -> None:
+        try:
+            self._request_queue.put(SessionRequest(prompt="", temporary=False, holder={},
+                                                   done_event=threading.Event(), control="restart"))
+        except Exception:
+            pass
 
-    def _session_state(self) -> str:
-        if self._startup_error is not None:
+    def request_restart(self, timeout: float = 120) -> bool:
+        """Recreate every worker's browser session (one-click recovery)."""
+        self._ensure_ready()
+        events = []
+        for _ in self._workers:
+            ev = threading.Event()
+            self._request_queue.put(SessionRequest(prompt="", temporary=False, holder={},
+                                                   done_event=ev, control="restart"))
+            events.append(ev)
+        deadline = time.time() + timeout
+        ok = True
+        for ev in events:
+            ok = ev.wait(max(0.0, deadline - time.time())) and ok
+        return ok
+
+    def _worker_state(self, w: Worker) -> str:
+        if w.startup_error is not None:
             return "browser_dead"
-        if not self._ready.is_set() or self._session is None:
+        if not w.ready.is_set() or w.session is None:
             return "starting"
-        if getattr(self._session, "logged_out", False):
+        if getattr(w.session, "logged_out", False):
             return "logged_out"
         return "logged_in"
 
+    def _session_state(self) -> str:
+        states = [self._worker_state(w) for w in self._workers]
+        for s in ("logged_in", "logged_out", "starting", "browser_dead"):
+            if s in states:
+                return s
+        return "browser_dead"
+
     def live_state(self) -> dict:
         now = time.time()
-        inf = self._in_flight
+        workers = []
         in_flight = None
-        if inf:
-            in_flight = {"model": inf.get("model"), "age_s": round(now - inf.get("started", now), 1)}
+        for w in self._workers:
+            wf = None
+            if w.in_flight:
+                wf = {"model": w.in_flight.get("model"),
+                      "age_s": round(now - w.in_flight.get("started", now), 1)}
+                if in_flight is None:
+                    in_flight = wf
+            workers.append({
+                "id": w.id,
+                "state": self._worker_state(w),
+                "in_flight": wf,
+                "browser_uptime_s": round(now - w.browser_start_ts) if w.browser_start_ts else None,
+                "restart_count": w.restart_count,
+            })
+        ups = [w.browser_start_ts for w in self._workers if w.browser_start_ts]
         return {
             "session_state": self._session_state(),
             "queue_depth": self.queue_depth(),
             "in_flight": in_flight,
             "proxy_uptime_s": round(now - self._proxy_start_ts),
-            "browser_uptime_s": round(now - self._browser_start_ts) if self._browser_start_ts else None,
-            "restart_count": self._restart_count,
+            "browser_uptime_s": round(now - min(ups)) if ups else None,
+            "restart_count": sum(w.restart_count for w in self._workers),
             "paused": self._paused,
             "degraded": self._degraded,
+            "pool_size": len(self._workers),
+            "workers": workers,
         }
 
-    def _do_restart(self) -> None:
-        logger.info("Restarting browser session (requested)...")
+    def _do_restart(self, w: Worker) -> None:
+        logger.info("Restarting browser session (worker %d)...", w.id)
         try:
-            if self._session is not None:
-                self._session.close()
+            if w.session is not None:
+                w.session.close()
         except Exception:
             pass
         try:
-            self._session = browser.ChatSession()
-            self._browser_start_ts = time.time()
-            self._restart_count += 1
-            self._startup_error = None
-            logger.info("Browser session restarted.")
+            w.session = browser.ChatSession(profile_dir=w.profile_dir,
+                                            session_token=w.session_token, cookies=w.cookies)
+            w.browser_start_ts = time.time()
+            w.restart_count += 1
+            w.startup_error = None
+            logger.info("Browser session restarted (worker %d).", w.id)
         except Exception as exc:
-            self._startup_error = exc
-            logger.exception("Browser restart failed.")
+            w.startup_error = exc
+            logger.exception("Browser restart failed (worker %d).", w.id)
 
-    def _run_turn(self, request: "SessionRequest", force_fresh: bool = False) -> None:
-        """Execute one chat turn (stream or not). Raises on failure (e.g. wedged composer)."""
-        self._start_new_chat(temporary=request.temporary, force=force_fresh)
+    def _run_turn(self, w: Worker, request: "SessionRequest", force_fresh: bool = False) -> None:
+        """Execute one chat turn on this worker (stream or not). Raises on failure."""
+        self._start_new_chat(w, temporary=request.temporary, force=force_fresh)
         if request.stream:
             assert isinstance(request.holder, queue.Queue)
-            page = self._session._page
+            page = w.session._page
             baseline = browser._read_answer_from_dom(page)   # previous answer (if chat reused)
-            self._session.send(request.prompt, request.model_slug, image=request.image, files=request.files)
+            w.session.send(request.prompt, request.model_slug, image=request.image, files=request.files)
             self._stream_answer_via_dom(page, request.holder, baseline=baseline)
         else:
             assert isinstance(request.holder, dict)
-            request.holder["answer"] = self._session.ask(
+            request.holder["answer"] = w.session.ask(
                 request.prompt, request.model_slug, image=request.image, files=request.files,
                 answer_timeout=TURN_HARD_TIMEOUT)
 
@@ -214,79 +254,83 @@ class BrowserSessionService:
             request.holder["error"] = str(exc)
 
     def stop(self) -> None:
-        if not self._worker:
+        if not self._threads:
             return
-        self._request_queue.put(None)
-        self._worker.join(timeout=30)
-        self._worker = None
-        self._ready.clear()
+        for _ in self._threads:
+            self._request_queue.put(None)
+        for t in self._threads:
+            t.join(timeout=30)
+        self._threads = []
 
-    def ask(self, prompt: str, temporary: bool = False, model_slug: str | None = None, image: bool = False, files: list | None = None, timeout: float | None = None) -> str:
+    def ask(self, prompt: str, temporary: bool = False, model_slug: str | None = None,
+            image: bool = False, files: list | None = None, timeout: float | None = None) -> str:
         self._ensure_ready()
         if timeout is None:
             timeout = FILE_TURN_TIMEOUT if files else DEFAULT_TURN_TIMEOUT
         result: dict[str, str] = {}
         done_event = threading.Event()
-        self._request_queue.put(SessionRequest(prompt=prompt, temporary=temporary, holder=result, done_event=done_event, model_slug=model_slug, image=image, files=files))
+        self._request_queue.put(SessionRequest(prompt=prompt, temporary=temporary, holder=result,
+                                               done_event=done_event, model_slug=model_slug,
+                                               image=image, files=files))
         if not done_event.wait(timeout):
             raise TimeoutError("Browser session timed out waiting for a response.")
         if "error" in result:
             raise RuntimeError(result["error"])
         return result.get("answer", "")
 
-    def stream(self, prompt: str, temporary: bool = False, model_slug: str | None = None, image: bool = False, files: list | None = None) -> queue.Queue:
+    def stream(self, prompt: str, temporary: bool = False, model_slug: str | None = None,
+               image: bool = False, files: list | None = None) -> queue.Queue:
         self._ensure_ready()
         chunk_queue: queue.Queue = queue.Queue()
         done_event = threading.Event()
-        self._request_queue.put(
-            SessionRequest(prompt=prompt, temporary=temporary, holder=chunk_queue, done_event=done_event, stream=True, model_slug=model_slug, image=image, files=files)
-        )
+        self._request_queue.put(SessionRequest(prompt=prompt, temporary=temporary, holder=chunk_queue,
+                                               done_event=done_event, stream=True, model_slug=model_slug,
+                                               image=image, files=files))
         return chunk_queue
 
     def _ensure_ready(self) -> None:
         if not self.wait_until_ready():
+            if not self.is_ready():
+                errs = [w.startup_error for w in self._workers if w.startup_error is not None]
+                if errs and all(w.startup_error is not None for w in self._workers):
+                    raise RuntimeError(f"Browser session failed to start: {errs[0]}")
             raise TimeoutError("Browser session did not become ready in time.")
-        if self._startup_error is not None:
-            raise RuntimeError(f"Browser session failed to start: {self._startup_error}")
 
-    def _check_and_restore_session(self) -> None:
-        if self._session is None:
+    def _check_and_restore_session(self, w: Worker) -> None:
+        if w.session is None:
             return
-        logger.info("Checking session health...")
         try:
-            if not self._session.is_alive():
-                logger.warning("Session expired — re-logging in...")
-                self._session.relogin()
-                logger.info("Session restored successfully.")
-            else:
-                logger.info("Session is alive.")
+            if not w.session.is_alive():
+                logger.warning("Session expired (worker %d) — re-logging in...", w.id)
+                w.session.relogin()
+                logger.info("Session restored (worker %d).", w.id)
         except Exception as exc:
-            logger.error("Session health check/restore failed: %s", exc)
+            logger.error("Session health check/restore failed (worker %d): %s", w.id, exc)
 
-    def _worker_loop(self) -> None:
-        logger.info("Starting browser session...")
+    def _worker_loop(self, w: Worker) -> None:
+        if w.id and POOL_STARTUP_STAGGER_S:
+            time.sleep(w.id * POOL_STARTUP_STAGGER_S)   # avoid N browsers hitting chatgpt.com at once
+        logger.info("Starting browser session (worker %d)...", w.id)
         try:
-            self._session = browser.ChatSession()
-            self._browser_start_ts = time.time()
+            w.session = browser.ChatSession(profile_dir=w.profile_dir,
+                                            session_token=w.session_token, cookies=w.cookies)
+            w.browser_start_ts = time.time()
         except Exception as exc:
-            self._startup_error = exc
-            logger.exception("Browser session startup failed.")
-            self._ready.set()
+            w.startup_error = exc
+            logger.exception("Browser session startup failed (worker %d).", w.id)
+            w.ready.set()
             return
 
-        self._ready.set()
-        logger.info("Browser session ready — accepting requests.")
-
+        w.ready.set()
+        logger.info("Browser session ready (worker %d) — accepting requests.", w.id)
         last_check = time.time()
 
         while True:
-            # Block until a request arrives or the health-check interval elapses
             time_until_check = max(0.1, SESSION_CHECK_INTERVAL - (time.time() - last_check))
             try:
                 request = self._request_queue.get(timeout=time_until_check)
             except queue.Empty:
-                # Interval elapsed with no requests — run health check
-                self._check_and_restore_session()
+                self._check_and_restore_session(w)
                 last_check = time.time()
                 continue
 
@@ -294,101 +338,117 @@ class BrowserSessionService:
                 break
 
             if request.control == "restart":
-                self._do_restart()
+                self._do_restart(w)
                 request.done_event.set()
                 last_check = time.time()
                 continue
 
-            self._in_flight = {"model": request.model_slug or "auto", "started": time.time()}
+            w.in_flight = {"model": request.model_slug or "auto", "started": time.time()}
             try:
-                self._run_turn(request)
+                self._run_turn(w, request)
             except browser.RateLimitedError as exc:
                 # ChatGPT said "too fast" → force a cooldown so we stop hammering the account,
                 # and surface a clean error (never return the throttle text as an answer).
-                logger.warning("ChatGPT rate-limited the account — tripping anti-ban cooldown.")
+                logger.warning("ChatGPT rate-limited (worker %d) — tripping anti-ban cooldown.", w.id)
                 try:
                     ratelimit.RATE.trip_cooldown()
                 except Exception:
                     pass
                 self._put_error(request, exc)
-            except browser.StaleChatError as exc:
+            except browser.StaleChatError:
                 # Expired temporary chat (24h idle) → force a brand-new chat and retry once.
-                # No browser restart needed; just navigate fresh (bypassing chat reuse).
-                logger.warning("Temporary chat expired — starting a fresh chat and retrying.")
+                logger.warning("Temporary chat expired (worker %d) — fresh chat + retry.", w.id)
                 try:
-                    self._run_turn(request, force_fresh=True)
+                    self._run_turn(w, request, force_fresh=True)
                 except Exception as exc2:
                     self._put_error(request, exc2)
-                    logger.error("Retry on fresh chat failed: %s", exc2)
+                    logger.error("Retry on fresh chat failed (worker %d): %s", w.id, exc2)
             except Exception as exc:
                 msg = str(exc)
-                # A page navigation can tear down a page.evaluate mid-flight ("execution
-                # context was destroyed"). The browser is fine — just retry the turn once
-                # (the SPA has settled by then), no restart needed.
                 nav_race = ("execution context" in msg.lower()) or ("navigation" in msg.lower())
-                # A wedged composer (#prompt-textarea timeout) is a real stuck-browser
-                # state — recreate the browser and retry once (re-upload on file turns is
-                # safe; legit slow upload/ingest waits don't raise, so they won't false-trip).
                 wedged = ("prompt-textarea" in msg) or ("Timeout" in msg) or ("composer" in msg.lower())
                 if nav_race and not wedged:
-                    logger.warning("Navigation race (%s) — retrying turn once.", msg[:80])
+                    logger.warning("Navigation race (worker %d: %s) — retrying once.", w.id, msg[:80])
                     time.sleep(1.0)
                     try:
-                        self._run_turn(request)
+                        self._run_turn(w, request)
                     except Exception as exc2:
                         self._put_error(request, exc2)
-                        logger.error("Retry after nav race failed: %s", exc2)
+                        logger.error("Retry after nav race failed (worker %d): %s", w.id, exc2)
                 elif wedged:
-                    logger.warning("Session wedged (%s) — recreating browser and retrying once.", msg[:80])
-                    self._do_restart()
+                    logger.warning("Session wedged (worker %d: %s) — recreating + retry.", w.id, msg[:80])
+                    self._do_restart(w)
                     try:
-                        self._run_turn(request)
+                        self._run_turn(w, request)
                     except Exception as exc2:
                         self._put_error(request, exc2)
-                        logger.error("Retry after restart failed: %s", exc2)
+                        logger.error("Retry after restart failed (worker %d): %s", w.id, exc2)
                 else:
                     self._put_error(request, exc)
-                    logger.error("Session error: %s", exc)
+                    logger.error("Session error (worker %d): %s", w.id, exc)
             finally:
-                self._in_flight = None
+                w.in_flight = None
                 request.done_event.set()
-                # Session was just used — reset the health-check timer
                 last_check = time.time()
 
-        logger.info("Shutting down browser session...")
-        if self._session is not None:
-            self._session.close()
+        logger.info("Shutting down browser session (worker %d)...", w.id)
+        if w.session is not None:
+            w.session.close()
 
-    def _start_new_chat(self, temporary: bool = False, force: bool = False) -> None:
-        assert self._session is not None
-        page = self._session._page
+    def _watchdog_loop(self) -> None:
+        """Detect a turn stuck far past its cap (a hard browser hang) on ANY worker and recover."""
+        while True:
+            time.sleep(WATCHDOG_INTERVAL)
+            now = time.time()
+            stuck_hard = False
+            stuck_soft = False
+            for w in self._workers:
+                inf = w.in_flight
+                if not inf:
+                    continue
+                age = now - inf.get("started", now)
+                if age > WATCHDOG_HARD_S:
+                    stuck_hard = True
+                elif age > WATCHDOG_SOFT_S:
+                    stuck_soft = True
+            if stuck_hard:
+                logger.critical("Watchdog: a turn is hard-hung (>%.0fs) — %s", WATCHDOG_HARD_S,
+                                "exiting for container restart" if WATCHDOG_HARD_EXIT else "enqueuing restart")
+                if WATCHDOG_HARD_EXIT:
+                    os._exit(1)   # Docker restart: unless-stopped recreates fresh browsers
+                self._safe_enqueue_restart()
+            elif stuck_soft:
+                if not self._degraded:
+                    self._degraded = True
+                    logger.warning("Watchdog: a turn is stuck (>%.0fs) — degraded, enqueuing restart.",
+                                   WATCHDOG_SOFT_S)
+                    self._safe_enqueue_restart()
+            else:
+                self._degraded = False
+
+    def _start_new_chat(self, w: Worker, temporary: bool = False, force: bool = False) -> None:
+        assert w.session is not None
+        page = w.session._page
         current = page.url
         target = "https://chatgpt.com/?temporary-chat=true" if temporary else "https://chatgpt.com"
 
-        # Reuse the current chat when we're already on the right kind of fresh page —
-        # reloading the SPA every turn makes the composer wedge constantly. Staleness from
-        # reuse (a prior answer lingering in the DOM) is handled at READ time via a baseline
-        # snapshot in ChatSession.ask (we reject any read equal to the pre-send answer).
-        # force=True bypasses reuse — used to recover from an expired temporary chat.
+        # Reuse the current chat only when allowed. force=True bypasses reuse (stale-chat recovery).
         if not force and not temporary and current.rstrip("/") == "https://chatgpt.com":
             return
-        # Reuse a temporary chat only when explicitly allowed — default is a fresh chat per turn
-        # so a prior turn's answer can never leak into this one (cross-wire / stale-baseline bug).
+        # Default: a fresh temporary chat per turn so a prior answer can't leak into this one.
         if (not force and temporary and not FRESH_TEMPORARY_CHAT
                 and "temporary-chat=true" in current and "/c/" not in current):
             return
 
         try:
             page.goto(target, wait_until="domcontentloaded", timeout=30_000)
-            # Wait for the composer (locator auto-waits, tolerates SPA navigation) BEFORE any
-            # raw evaluate, else a late nav tears it down ("execution context destroyed").
             browser._ensure_composer(page)
             try:
                 page.evaluate(browser.FETCH_INTERCEPT_JS)   # re-assert; init script already injected it
             except Exception:
                 pass
         except Exception as exc:
-            logger.warning("Could not start new chat: %s", exc)
+            logger.warning("Could not start new chat (worker %d): %s", w.id, exc)
 
     def _stream_answer_via_dom(self, page, chunk_queue: queue.Queue, baseline: str = "") -> None:
         sent = ""
@@ -408,12 +468,8 @@ class BrowserSessionService:
                     raise browser.RateLimitedError("ChatGPT is rate-limiting the account (requests too fast).")
                 if browser._is_stale_chat(_dom):
                     raise browser.StaleChatError("ChatGPT temporary chat expired (chat history off).")
-            # Real completion comes from the WebSocket interceptor; the fetch handoff
-            # (__sse_done) fires too early now that answers stream over the socket.
             done = bool(page.evaluate("() => !!window.__answer_done"))
             started = started or bool(page.evaluate("() => !!window.__turn_started"))
-            # strict=True → only the .markdown answer container (skips the "Thinking"
-            # reasoning phase). Ignore a lingering previous answer (reused chat) via baseline.
             current_markdown = browser._read_answer_from_dom(page, strict=True)
             if not current_markdown or current_markdown == baseline:
                 current_markdown = ""
@@ -427,7 +483,6 @@ class BrowserSessionService:
 
             previous_safe = safe_prefix
 
-            # DOM-stability fallback if completion markers ever change again.
             if current_markdown != last_markdown:
                 last_markdown = current_markdown
                 last_change = time.time()
@@ -439,7 +494,6 @@ class BrowserSessionService:
                 time.sleep(0.4)
                 final_markdown = browser._read_answer_from_dom(page, strict=True)
                 if not final_markdown or final_markdown == baseline:
-                    # strict empty/stale — fall back to the full read, but never the baseline.
                     nf = browser._read_answer_from_dom(page)
                     final_markdown = nf if (nf and nf != baseline) else sent
                 if len(final_markdown) > len(sent):
@@ -462,14 +516,11 @@ class BrowserSessionService:
     def _stream_safe_prefix(markdown: str, done: bool = False) -> str:
         if done or not markdown:
             return markdown
-
         matches = list(re.finditer(r"```[^\n]*\n.*?\n```(?:\n)?", markdown, re.DOTALL))
         if not matches:
             return markdown
-
         last_match = matches[-1]
         trailing = markdown[last_match.end():]
         if trailing.strip():
             return markdown
-
         return markdown[:last_match.start()]

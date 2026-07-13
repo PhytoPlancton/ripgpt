@@ -62,19 +62,21 @@ def _parse_cookie_string(raw: str) -> list[tuple]:
     return pairs
 
 
-def _build_auth_cookies() -> list[dict]:
-    """Build Playwright cookies from env.
+def _build_auth_cookies(session_token: str | None = None, cookies_str: str | None = None) -> list[dict]:
+    """Build Playwright cookies from a session token / cookie string (defaults to env globals).
 
-    Use CHATGPT_COOKIES (the full cookie string) when your session token is chunked
-    into __Secure-next-auth.session-token.0/.1 — a single CHATGPT_SESSION_TOKEN can't
-    represent that. Cookies are added by url so Playwright sets domain/path/secure
-    correctly, including the __Secure-/__Host- prefixes.
+    Use the cookie string (the full cookie header) when your session token is chunked
+    into __Secure-next-auth.session-token.0/.1 — a single token can't represent that.
+    Cookies are added by url so Playwright sets domain/path/secure correctly, including
+    the __Secure-/__Host- prefixes.
     """
+    session_token = CHATGPT_SESSION_TOKEN if session_token is None else session_token
+    cookies_str = CHATGPT_COOKIES if cookies_str is None else cookies_str
     pairs: list[tuple] = []
-    if CHATGPT_SESSION_TOKEN:
-        pairs.append((SESSION_COOKIE_NAME, CHATGPT_SESSION_TOKEN))
-    if CHATGPT_COOKIES:
-        pairs.extend(_parse_cookie_string(CHATGPT_COOKIES))
+    if session_token:
+        pairs.append((SESSION_COOKIE_NAME, session_token))
+    if cookies_str:
+        pairs.extend(_parse_cookie_string(cookies_str))
 
     cookies = []
     skipped_cf = 0
@@ -930,15 +932,20 @@ def _wait_for_answer(page, image=False, files=False, timeout=None, baseline=""):
 class ChatSession:
     """Persistent browser session used by the API worker."""
 
-    def __init__(self):
+    def __init__(self, profile_dir=None, session_token=None, cookies=None):
+        # Per-account config (defaults to the module globals → single-account behaviour
+        # unchanged). A multi-account pool passes a distinct profile_dir + cookies per slot.
+        self._profile_dir = BROWSER_PROFILE_DIR if profile_dir is None else profile_dir
+        self._session_token = CHATGPT_SESSION_TOKEN if session_token is None else session_token
+        self._cookies = CHATGPT_COOKIES if cookies is None else cookies
         self._playwright = sync_playwright().start()
-        self._persistent = bool(BROWSER_PROFILE_DIR)
+        self._persistent = bool(self._profile_dir)
         if self._persistent:
-            # Persistent context: cookies/storage live in BROWSER_PROFILE_DIR (a volume),
+            # Persistent context: cookies/storage live in the profile dir (a volume),
             # so the session survives restarts and ChatGPT auto-renews its token on use.
-            os.makedirs(BROWSER_PROFILE_DIR, exist_ok=True)
+            os.makedirs(self._profile_dir, exist_ok=True)
             self._context = self._playwright.firefox.launch_persistent_context(
-                BROWSER_PROFILE_DIR,
+                self._profile_dir,
                 headless=HEADLESS,
                 user_agent=USER_AGENT,
                 viewport={"width": 1280, "height": 800},
@@ -977,7 +984,7 @@ class ChatSession:
             bootstrap = False
 
         if bootstrap:
-            cookies = _build_auth_cookies()
+            cookies = _build_auth_cookies(self._session_token, self._cookies)
             if cookies:
                 # Bootstrap the session from the env cookie (one-time on a fresh profile, or
                 # a re-bootstrap if the persisted session was lost), then reload.
@@ -993,17 +1000,18 @@ class ChatSession:
 
     def _ensure_session(self) -> None:
         """Confirm the page is usable; raise a clear error on a bad/expired token."""
+        has_auth = bool(self._session_token or self._cookies)
         if "/auth" in self._page.url or "/login" in self._page.url:
-            if _has_auth():
+            if has_auth:
                 raise RuntimeError(
-                    "ChatGPT rejected the session cookie — CHATGPT_SESSION_TOKEN is "
+                    "ChatGPT rejected the session cookie — the session token is "
                     "invalid or expired. Copy a fresh __Secure-next-auth.session-token."
                 )
-            raise RuntimeError("Not authenticated and no CHATGPT_SESSION_TOKEN set (.env).")
+            raise RuntimeError("Not authenticated and no ChatGPT session cookie set (.env).")
         # Composer is present both logged-in and in anonymous mode.
         _dismiss_dialogs(self._page)
         _ensure_composer(self._page)
-        self.logged_out = bool(_has_auth() and self._looks_logged_out())
+        self.logged_out = bool(has_auth and self._looks_logged_out())
         if self.logged_out:
             _log("[browser] WARNING: token set but page looks logged-out — "
                  "CHATGPT_SESSION_TOKEN may be expired (running anonymously).")
