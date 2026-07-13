@@ -214,6 +214,13 @@ DASHBOARD_HTML = r"""<!doctype html>
   .fld input{width:100%}
   .kv{display:grid;grid-template-columns:160px 1fr;gap:6px 12px;font-family:var(--mono);font-size:12px}
   .kv .kk{color:var(--muted)}
+  .logitem{border:1px solid var(--line);border-radius:8px;margin-bottom:8px;background:var(--panel2)}
+  .logitem summary{cursor:pointer;padding:9px 11px;font-family:var(--mono);font-size:12px;list-style:none}
+  .logitem summary::-webkit-details-marker{display:none}
+  .logitem[open] summary{border-bottom:1px solid var(--line)}
+  .loglabel{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);padding:8px 11px 2px}
+  .logpre{margin:0 11px 10px;padding:10px;background:var(--bg);border:1px solid var(--line);border-radius:6px;
+          font-family:var(--mono);font-size:11px;white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;color:var(--text)}
   .foot{margin-top:20px;font-family:var(--mono);font-size:11px;color:var(--muted);text-align:center}
 </style>
 </head>
@@ -231,6 +238,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <nav class="tabs" id="tabs">
     <button data-tab="overview" class="active">Vue d'ensemble</button>
     <button data-tab="usage">Usage &amp; Coût</button>
+    <button data-tab="logs">Prompts</button>
     <button data-tab="keys">Clés API</button>
     <button data-tab="models">Modèles</button>
     <button data-tab="settings">Réglages</button>
@@ -272,6 +280,15 @@ DASHBOARD_HTML = r"""<!doctype html>
         <thead><tr><th>quand</th><th>modèle</th><th>statut</th><th>latence</th><th>sortie</th></tr></thead>
         <tbody id="recentBody"><tr><td colspan="5" class="muted">waiting…</td></tr></tbody>
       </table></div>
+    </div>
+  </section>
+
+  <!-- ── Prompts (conversation log) ── -->
+  <section id="tab-logs" class="tab">
+    <div class="card">
+      <h3>Prompts envoyés à ChatGPT <span class="act"><button id="refreshLogs">⟳ refresh</button> <button class="warn" id="clearLogs">vider</button></span></h3>
+      <p class="muted" style="font-size:12px;margin:-4px 0 10px">Le prompt exact (historique aplati) envoyé pour chaque requête + la réponse. En mémoire (perdu au redémarrage), max 200.</p>
+      <div id="logsList"><div class="muted">chargement…</div></div>
     </div>
   </section>
 
@@ -396,6 +413,7 @@ function switchTab(name){
   if(name==='keys') loadKeys();
   if(name==='models') loadModels();
   if(name==='settings') loadSettings();
+  if(name==='logs') loadLogs();
   setTimeout(()=>{ [reqChart,latChart,costChart].forEach(c=>{ try{c&&c.resize();}catch(e){} }); }, 60);
 }
 document.querySelectorAll('nav.tabs button').forEach(b=> b.onclick=()=>switchTab(b.dataset.tab));
@@ -614,7 +632,33 @@ async function doPause(){ const b=$('pauseBtn'), msg=$('sessionMsg'); b.disabled
   }catch(e){} b.disabled=false;
 }
 
+/* ── Prompts (conversation log) ── */
+function renderLogs(list){
+  if(!list.length){ $('logsList').innerHTML='<div class="muted">aucune requête enregistrée pour l\'instant</div>'; return; }
+  $('logsList').innerHTML = list.map(c=>{
+    const st = c.status==='ok'
+      ? '<span class="tag" style="color:var(--green);border-color:#1c3b2c">ok</span>'
+      : '<span class="tag" style="color:var(--red);border-color:#3b1c28">'+esc(c.error_class||'error')+'</span>';
+    const model=esc(c.model_res||c.model_req||'?');
+    const preview=esc((c.prompt||'').slice(0,90).replace(/\s+/g,' '));
+    return `<details class="logitem">
+      <summary>${st} <b>${model}</b> · ${rel(c.ts)} · ${c.ptoks||0}p/${c.ctoks||0}c${c.key_id?(' · '+esc(c.key_id)):''} <span class="muted">— ${preview}…</span></summary>
+      <div class="loglabel">PROMPT ENVOYÉ${c.prompt_truncated?' (tronqué)':''}</div>
+      <pre class="logpre">${esc(c.prompt||'(vide)')}</pre>
+      <div class="loglabel">RÉPONSE${c.answer_truncated?' (tronquée)':''}</div>
+      <pre class="logpre">${esc(c.answer||'(vide)')}</pre>
+    </details>`;
+  }).join('');
+}
+async function loadLogs(){
+  try{ const j=await (await api('/admin/logs?limit=100')).json(); renderLogs(j.conversations||[]); }
+  catch(e){ $('logsList').innerHTML='<div class="muted">erreur de chargement</div>'; }
+}
+async function clearLogs(){ if(!confirm('Vider le journal des prompts ?')) return;
+  try{ await api('/admin/logs/clear',{method:'POST'}); loadLogs(); }catch(e){} }
+
 /* ── wiring ── */
+$('refreshLogs').onclick=loadLogs; $('clearLogs').onclick=clearLogs;
 $('createKeyBtn').onclick=createKey; $('keyName').addEventListener('keydown',e=>{if(e.key==='Enter')createKey();});
 $('testBtn').onclick=runTest; $('testPrompt').addEventListener('keydown',e=>{if(e.key==='Enter')runTest();});
 $('saveSettingsBtn').onclick=saveSettings;

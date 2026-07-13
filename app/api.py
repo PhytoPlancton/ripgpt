@@ -634,7 +634,7 @@ def create_app() -> FastAPI:
         except Exception as exc:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
-                           key_id=key_id)
+                           key_id=key_id, prompt=prompt)
             return _error_response(_safe_upstream_error(exc), status_code=500, error_type="server_error")
 
         latency_ms = int((time.time() - t0) * 1000)
@@ -644,7 +644,7 @@ def create_app() -> FastAPI:
         METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
                        error_class=None if ok else "empty_reply", latency_ms=latency_ms,
                        ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img,
-                       key_id=key_id)
+                       key_id=key_id, prompt=prompt, answer=answer)
         return _make_chat_completion_response(completion_id, created, resolved_model, answer, prompt)
 
     @app.post("/v1/completions")
@@ -697,7 +697,7 @@ def create_app() -> FastAPI:
         except Exception as exc:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
-                           key_id=key_id)
+                           key_id=key_id, prompt=prompt)
             return _error_response(_safe_upstream_error(exc), status_code=500, error_type="server_error")
 
         latency_ms = int((time.time() - t0) * 1000)
@@ -707,7 +707,7 @@ def create_app() -> FastAPI:
         METRICS.record(model_req=resolved_model, model_res=slug, status="ok" if ok else "error",
                        error_class=None if ok else "empty_reply", latency_ms=latency_ms,
                        ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img,
-                       key_id=key_id)
+                       key_id=key_id, prompt=prompt, answer=answer)
         return _make_completion_response(completion_id, created, resolved_model, answer, prompt)
 
     @app.get("/health")
@@ -927,6 +927,23 @@ def create_app() -> FastAPI:
         resp.delete_cookie(CSRF_COOKIE, path="/")
         return resp
 
+    # ── conversation log: exact prompts sent to ChatGPT + answers (in-memory) ──
+    @app.get("/admin/logs")
+    async def admin_logs(request: Request):
+        _require_admin(request)
+        try:
+            limit = int(request.query_params.get("limit", "50"))
+        except Exception:
+            limit = 50
+        return {"conversations": METRICS.recent_conversations(max(1, min(limit, 200)))}
+
+    @app.post("/admin/logs/clear")
+    async def admin_logs_clear(request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        METRICS.clear_conversations()
+        return {"ok": True}
+
     # ── test prompt from the console ───────────────────────────────────────────
     @app.post("/admin/test")
     async def admin_test(request: Request):
@@ -960,7 +977,7 @@ def create_app() -> FastAPI:
         except Exception as exc:
             METRICS.record(model_req=resolved, model_res=slug, status="error",
                            error_class=classify_error(str(exc)),
-                           latency_ms=int((time.time() - t0) * 1000), key_id="console")
+                           latency_ms=int((time.time() - t0) * 1000), key_id="console", prompt=prompt)
             return _error_response(_safe_upstream_error(exc), status_code=500, error_type="server_error")
         latency_ms = int((time.time() - t0) * 1000)
         answer, n_img = _externalize_images(answer, _base_url(request))
@@ -968,7 +985,7 @@ def create_app() -> FastAPI:
         METRICS.record(model_req=resolved, model_res=slug, status="ok" if ok else "error",
                        error_class=None if ok else "empty_reply", latency_ms=latency_ms,
                        ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), images=n_img,
-                       key_id="console")
+                       key_id="console", prompt=prompt, answer=answer)
         return {"model": resolved, "answer": answer, "latency_ms": latency_ms, "images": n_img}
 
     # ── usage export ───────────────────────────────────────────────────────────
@@ -1066,7 +1083,7 @@ async def _stream_chat_completion(
         except Exception as exc:
             METRICS.record(model_req=model, model_res=model_slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
-                           key_id=key_id)
+                           key_id=key_id, prompt=prompt)
             yield _delta(f"[Error: {_safe_upstream_error(exc)}]")
             yield "data: [DONE]\n\n"
             return
@@ -1078,7 +1095,7 @@ async def _stream_chat_completion(
             if isinstance(item, dict) and item.get("error"):
                 METRICS.record(model_req=model, model_res=model_slug, status="error",
                                error_class=classify_error(str(item["error"])), latency_ms=int((time.time() - t0) * 1000),
-                               key_id=key_id)
+                               key_id=key_id, prompt=prompt)
                 yield _delta(f"[Error: {_safe_upstream_error(item['error'])}]")
                 yield "data: [DONE]\n\n"
                 return
@@ -1088,7 +1105,8 @@ async def _stream_chat_completion(
         _ok = bool(answer.strip())
         METRICS.record(model_req=model, model_res=model_slug, status="ok" if _ok else "error",
                        error_class=None if _ok else "empty_reply", latency_ms=int((time.time() - t0) * 1000),
-                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), key_id=key_id)
+                       ptoks=_count_tokens(prompt), ctoks=_count_tokens(answer), key_id=key_id,
+                       prompt=prompt, answer=answer)
         for frame in _tail(answer):
             yield frame
         return
@@ -1099,7 +1117,7 @@ async def _stream_chat_completion(
     except Exception as exc:
         METRICS.record(model_req=model, model_res=model_slug, status="error",
                        error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
-                       key_id=key_id)
+                       key_id=key_id, prompt=prompt)
         error_chunk = {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -1169,7 +1187,7 @@ async def _stream_completion(
     except Exception as exc:
         METRICS.record(model_req=model, model_res=model_slug, status="error",
                        error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
-                       key_id=key_id)
+                       key_id=key_id, prompt=prompt)
         error_chunk = {
             "id": completion_id,
             "object": "text_completion",

@@ -30,6 +30,12 @@ _LIFETIME_DEFAULTS = {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
 _BYKEY_DEFAULTS = {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
                    "images": 0, "last_ts": None, "cost": 0.0}
 
+# Conversation log: keep the last N outgoing prompts + answers in memory so the admin can
+# inspect exactly what was sent to ChatGPT. In-memory only (not persisted) — it can hold
+# prospect PII, so it dies on restart and is gated behind the admin login. CONVLOG_MAX=0 disables.
+_CONVLOG_MAX = int(os.environ.get("CONVLOG_MAX", "200"))
+_CONV_FIELD_MAX = int(os.environ.get("CONVLOG_FIELD_MAX", "20000"))
+
 
 def classify_error(message: str) -> str:
     m = (message or "").lower()
@@ -68,6 +74,7 @@ class Metrics:
         self._by_key: dict[str, dict] = {}
         self._path = path
         self._last_persist = 0.0
+        self._conversations: deque = deque(maxlen=_CONVLOG_MAX)   # in-memory prompt/answer log
         self._load()
 
     # ── persistence (all-time counters only) ───────────────────────────────────
@@ -109,7 +116,7 @@ class Metrics:
     def record(self, *, model_req: str, model_res: str | None, status: str,
                error_class: str | None, latency_ms: int,
                ptoks: int = 0, ctoks: int = 0, images: int = 0,
-               key_id: str | None = None) -> None:
+               key_id: str | None = None, prompt: str = "", answer: str = "") -> None:
         now = time.time()
         mres = model_res or model_req
         cost = pricing.cost_for(mres, int(ptoks), int(ctoks), int(images))
@@ -126,6 +133,16 @@ class Metrics:
         }
         with self._lock:
             self._recent.append(rec)
+            if (prompt or answer) and _CONVLOG_MAX > 0:
+                p = prompt or ""
+                a = answer or ""
+                self._conversations.append({
+                    "ts": now, "model_req": model_req, "model_res": mres, "key_id": key_id,
+                    "status": status, "error_class": error_class, "latency_ms": int(latency_ms),
+                    "ptoks": int(ptoks), "ctoks": int(ctoks),
+                    "prompt": p[:_CONV_FIELD_MAX], "prompt_truncated": len(p) > _CONV_FIELD_MAX,
+                    "answer": a[:_CONV_FIELD_MAX], "answer_truncated": len(a) > _CONV_FIELD_MAX,
+                })
             if key_id:
                 k = self._by_key.setdefault(
                     key_id, {"req": 0, "ok": 0, "err": 0, "ptoks": 0, "ctoks": 0,
@@ -166,6 +183,15 @@ class Metrics:
             ratelimit.RATE.note_result(status == "ok", error_class)
         except Exception:
             pass
+
+    def recent_conversations(self, limit: int = 100) -> list:
+        with self._lock:
+            items = list(self._conversations)
+        return list(reversed(items))[:max(0, limit)]
+
+    def clear_conversations(self) -> None:
+        with self._lock:
+            self._conversations.clear()
 
     def _window(self, recs: list, seconds: float, now: float) -> list:
         cutoff = now - seconds
