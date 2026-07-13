@@ -122,6 +122,24 @@ FILE_ANSWER_TIMEOUT = float(os.environ.get("FILE_ANSWER_TIMEOUT", "540"))   # in
 # accept it — a transport-independent safety net if OpenAI changes its markers.
 DOM_STABLE_SECS = float(os.environ.get("DOM_STABLE_SECS", "2.5"))
 
+# ChatGPT interstitial shown when a temporary (history-off) chat has expired after ~24h of
+# inactivity. ripgpt reuses temporary chats between turns, so after a long idle the next turn
+# hits this wall — it must be treated as "start a fresh chat + retry", NEVER as the answer.
+_STALE_CHAT_MARKERS = (
+    "conversations created when chat history is off",
+    "start a new conversation to continue using chatgpt",
+    "chat history is off expire",
+)
+
+
+def _is_stale_chat(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _STALE_CHAT_MARKERS)
+
+
+class StaleChatError(RuntimeError):
+    """The temporary chat expired; the turn must be retried on a fresh chat."""
+
 # Injected as an init-script. Hooks BOTH window.fetch AND window.WebSocket.
 #
 # Why WebSocket: since ~2025, POST /backend-api/f/conversation no longer streams the
@@ -843,6 +861,10 @@ def _wait_for_answer(page, image=False, files=False, timeout=None, baseline=""):
         _log("[*] DOM still shows the previous answer — using the per-turn stream parse instead.")
     elif not answer:
         _log("[*] DOM answer empty and stream parse empty.")
+
+    if _is_stale_chat(answer):
+        _log("[*] Temporary chat expired — signalling fresh-chat retry.")
+        raise StaleChatError("ChatGPT temporary chat expired (chat history off).")
 
     if capture_images:
         # Image model: an image is definitely coming → poll long. File turns: if the text

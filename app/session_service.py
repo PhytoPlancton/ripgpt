@@ -180,9 +180,9 @@ class BrowserSessionService:
             self._startup_error = exc
             logger.exception("Browser restart failed.")
 
-    def _run_turn(self, request: "SessionRequest") -> None:
+    def _run_turn(self, request: "SessionRequest", force_fresh: bool = False) -> None:
         """Execute one chat turn (stream or not). Raises on failure (e.g. wedged composer)."""
-        self._start_new_chat(temporary=request.temporary)
+        self._start_new_chat(temporary=request.temporary, force=force_fresh)
         if request.stream:
             assert isinstance(request.holder, queue.Queue)
             page = self._session._page
@@ -293,6 +293,15 @@ class BrowserSessionService:
             self._in_flight = {"model": request.model_slug or "auto", "started": time.time()}
             try:
                 self._run_turn(request)
+            except browser.StaleChatError as exc:
+                # Expired temporary chat (24h idle) → force a brand-new chat and retry once.
+                # No browser restart needed; just navigate fresh (bypassing chat reuse).
+                logger.warning("Temporary chat expired — starting a fresh chat and retrying.")
+                try:
+                    self._run_turn(request, force_fresh=True)
+                except Exception as exc2:
+                    self._put_error(request, exc2)
+                    logger.error("Retry on fresh chat failed: %s", exc2)
             except Exception as exc:
                 msg = str(exc)
                 # A page navigation can tear down a page.evaluate mid-flight ("execution
@@ -332,7 +341,7 @@ class BrowserSessionService:
         if self._session is not None:
             self._session.close()
 
-    def _start_new_chat(self, temporary: bool = False) -> None:
+    def _start_new_chat(self, temporary: bool = False, force: bool = False) -> None:
         assert self._session is not None
         page = self._session._page
         current = page.url
@@ -342,9 +351,10 @@ class BrowserSessionService:
         # reloading the SPA every turn makes the composer wedge constantly. Staleness from
         # reuse (a prior answer lingering in the DOM) is handled at READ time via a baseline
         # snapshot in ChatSession.ask (we reject any read equal to the pre-send answer).
-        if not temporary and current.rstrip("/") == "https://chatgpt.com":
+        # force=True bypasses reuse — used to recover from an expired temporary chat.
+        if not force and not temporary and current.rstrip("/") == "https://chatgpt.com":
             return
-        if temporary and "temporary-chat=true" in current and "/c/" not in current:
+        if not force and temporary and "temporary-chat=true" in current and "/c/" not in current:
             return
 
         try:
@@ -369,6 +379,10 @@ class BrowserSessionService:
         time.sleep(0.5)
 
         while time.time() < deadline:
+            # An expired temporary chat shows an interstitial instead of an answer. Detect it
+            # before streaming anything so the worker can retry on a fresh chat (never emit it).
+            if not sent and browser._is_stale_chat(browser._read_answer_from_dom(page)):
+                raise browser.StaleChatError("ChatGPT temporary chat expired (chat history off).")
             # Real completion comes from the WebSocket interceptor; the fetch handoff
             # (__sse_done) fires too early now that answers stream over the socket.
             done = bool(page.evaluate("() => !!window.__answer_done"))
