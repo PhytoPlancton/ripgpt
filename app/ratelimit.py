@@ -81,6 +81,14 @@ class RateGovernor:
                     self._breaker_trips += 1
                     self._consec_throttle = 0
 
+    def trip_cooldown(self, seconds: float | None = None) -> None:
+        """Force an immediate cooldown — called when ChatGPT explicitly says 'too fast'."""
+        dur = seconds if seconds is not None else SETTINGS.get("breaker_cooldown_s")
+        with self._lock:
+            self._cooldown_until = max(self._cooldown_until, time.time() + dur)
+            self._breaker_trips += 1
+            self._consec_throttle = 0
+
     def snapshot(self) -> dict:
         now = time.time()
         s = SETTINGS.all()

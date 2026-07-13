@@ -39,6 +39,8 @@ _CONV_FIELD_MAX = int(os.environ.get("CONVLOG_FIELD_MAX", "20000"))
 
 def classify_error(message: str) -> str:
     m = (message or "").lower()
+    if "rate-limit" in m or "too fast" in m or "trop rapidement" in m:
+        return "rate"
     if "prompt-textarea" in m or "composer" in m:
         return "composer_timeout"
     if "logged" in m and "out" in m:

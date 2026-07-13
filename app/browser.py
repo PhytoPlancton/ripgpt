@@ -140,6 +140,28 @@ def _is_stale_chat(text: str) -> bool:
 class StaleChatError(RuntimeError):
     """The temporary chat expired; the turn must be retried on a fresh chat."""
 
+
+# ChatGPT's account-level throttle ("you're sending requests too fast — temporarily
+# restricted"). Must trigger a cooldown (back off), never be returned to the client as an answer.
+_RATE_LIMIT_MARKERS = (
+    "vous envoyez des demandes trop rapidement",
+    "temporairement restreint",
+    "veuillez attendre quelques minutes",
+    "you're sending requests too",
+    "sending messages too quickly",
+    "temporarily restricted",
+    "please wait a few minutes",
+)
+
+
+def _is_rate_limited(text: str) -> bool:
+    low = (text or "").lower()
+    return any(m in low for m in _RATE_LIMIT_MARKERS)
+
+
+class RateLimitedError(RuntimeError):
+    """ChatGPT is throttling the account — back off (cooldown), do not return as an answer."""
+
 # Injected as an init-script. Hooks BOTH window.fetch AND window.WebSocket.
 #
 # Why WebSocket: since ~2025, POST /backend-api/f/conversation no longer streams the
@@ -861,6 +883,10 @@ def _wait_for_answer(page, image=False, files=False, timeout=None, baseline=""):
         _log("[*] DOM still shows the previous answer — using the per-turn stream parse instead.")
     elif not answer:
         _log("[*] DOM answer empty and stream parse empty.")
+
+    if _is_rate_limited(answer):
+        _log("[*] ChatGPT account throttled (too fast) — signalling cooldown.")
+        raise RateLimitedError("ChatGPT is rate-limiting the account (requests too fast).")
 
     if _is_stale_chat(answer):
         _log("[*] Temporary chat expired — signalling fresh-chat retry.")

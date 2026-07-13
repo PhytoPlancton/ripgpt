@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass
 
 from . import browser
+from . import ratelimit
 
 
 logger = logging.getLogger("ripgpt.session")
@@ -301,6 +302,15 @@ class BrowserSessionService:
             self._in_flight = {"model": request.model_slug or "auto", "started": time.time()}
             try:
                 self._run_turn(request)
+            except browser.RateLimitedError as exc:
+                # ChatGPT said "too fast" → force a cooldown so we stop hammering the account,
+                # and surface a clean error (never return the throttle text as an answer).
+                logger.warning("ChatGPT rate-limited the account — tripping anti-ban cooldown.")
+                try:
+                    ratelimit.RATE.trip_cooldown()
+                except Exception:
+                    pass
+                self._put_error(request, exc)
             except browser.StaleChatError as exc:
                 # Expired temporary chat (24h idle) → force a brand-new chat and retry once.
                 # No browser restart needed; just navigate fresh (bypassing chat reuse).
@@ -390,10 +400,14 @@ class BrowserSessionService:
         time.sleep(0.5)
 
         while time.time() < deadline:
-            # An expired temporary chat shows an interstitial instead of an answer. Detect it
-            # before streaming anything so the worker can retry on a fresh chat (never emit it).
-            if not sent and browser._is_stale_chat(browser._read_answer_from_dom(page)):
-                raise browser.StaleChatError("ChatGPT temporary chat expired (chat history off).")
+            # ChatGPT interstitials appear instead of an answer — detect before streaming so
+            # the worker backs off / retries on a fresh chat (never emit the wall text).
+            if not sent:
+                _dom = browser._read_answer_from_dom(page)
+                if browser._is_rate_limited(_dom):
+                    raise browser.RateLimitedError("ChatGPT is rate-limiting the account (requests too fast).")
+                if browser._is_stale_chat(_dom):
+                    raise browser.StaleChatError("ChatGPT temporary chat expired (chat history off).")
             # Real completion comes from the WebSocket interceptor; the fetch handoff
             # (__sse_done) fires too early now that answers stream over the socket.
             done = bool(page.evaluate("() => !!window.__answer_done"))
