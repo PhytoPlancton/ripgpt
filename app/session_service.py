@@ -38,6 +38,14 @@ WATCHDOG_HARD_S = float(os.environ.get("WATCHDOG_HARD_S", "200"))
 WATCHDOG_HARD_EXIT = (os.environ.get("WATCHDOG_HARD_EXIT", "true").strip().lower()
                       in ("1", "true", "yes", "on"))
 
+# Reusing ONE temporary chat across turns lets a previous turn's answer leak into the next
+# (baseline race → cross-wired / empty answers when a client fires many rapid one-shot prompts,
+# e.g. classify + generate + variants — exactly tailr's pattern). Those calls are stateless, so
+# by default start a FRESH temporary chat every turn: correctness over the small reload cost.
+# Set FRESH_TEMPORARY_CHAT=false to restore reuse (faster, but answers can cross-wire).
+FRESH_TEMPORARY_CHAT = (os.environ.get("FRESH_TEMPORARY_CHAT", "true").strip().lower()
+                        in ("1", "true", "yes", "on"))
+
 
 @dataclass(slots=True)
 class SessionRequest:
@@ -354,7 +362,10 @@ class BrowserSessionService:
         # force=True bypasses reuse — used to recover from an expired temporary chat.
         if not force and not temporary and current.rstrip("/") == "https://chatgpt.com":
             return
-        if not force and temporary and "temporary-chat=true" in current and "/c/" not in current:
+        # Reuse a temporary chat only when explicitly allowed — default is a fresh chat per turn
+        # so a prior turn's answer can never leak into this one (cross-wire / stale-baseline bug).
+        if (not force and temporary and not FRESH_TEMPORARY_CHAT
+                and "temporary-chat=true" in current and "/c/" not in current):
             return
 
         try:

@@ -43,6 +43,10 @@ services:
       - WATCHDOG_SOFT_S=${WATCHDOG_SOFT_S:-130}
       - WATCHDOG_HARD_S=${WATCHDOG_HARD_S:-200}
       - WATCHDOG_HARD_EXIT=${WATCHDOG_HARD_EXIT:-true}
+      # Fresh temporary chat per turn (default) so a prior turn's answer can't leak into the
+      # next one (fixes cross-wired/empty answers when a client fires many rapid one-shot
+      # prompts). Set false to reuse one chat (faster, but answers can cross-wire).
+      - FRESH_TEMPORARY_CHAT=${FRESH_TEMPORARY_CHAT:-true}
       - CHATGPT_SESSION_TOKEN=${CHATGPT_SESSION_TOKEN:-}
       - CHATGPT_COOKIES=${CHATGPT_COOKIES:-}
       - INJECT_CF_COOKIES=${INJECT_CF_COOKIES:-false}
