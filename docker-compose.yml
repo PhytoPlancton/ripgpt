@@ -40,6 +40,10 @@ services:
       # a clean error instead of a 524 and can't hog the single browser. Watchdog auto-
       # restarts the container if a turn hard-hangs (needs restart: unless-stopped, set below).
       - TURN_HARD_TIMEOUT=${TURN_HARD_TIMEOUT:-85}
+      # File/doc turns need much longer than text (ChatGPT ingesting a multi-MB doc); the
+      # streaming path emits SSE keepalives so Cloudflare doesn't idle-drop during ingest.
+      - FILE_TURN_HARD_TIMEOUT=${FILE_TURN_HARD_TIMEOUT:-300}
+      - SSE_KEEPALIVE_S=${SSE_KEEPALIVE_S:-15}
       - WATCHDOG_SOFT_S=${WATCHDOG_SOFT_S:-130}
       - WATCHDOG_HARD_S=${WATCHDOG_HARD_S:-200}
       - WATCHDOG_HARD_EXIT=${WATCHDOG_HARD_EXIT:-true}

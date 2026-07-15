@@ -19,8 +19,12 @@ SESSION_CHECK_INTERVAL = int(os.environ.get("SESSION_CHECK_INTERVAL", "900"))
 FILE_TURN_TIMEOUT = int(os.environ.get("FILE_TURN_TIMEOUT", "840"))
 DEFAULT_TURN_TIMEOUT = 330
 
-# Hard ceiling on how long a SINGLE turn may occupy a browser (kept under Cloudflare's ~100s).
+# Hard ceiling on how long a SINGLE text turn may occupy a browser (kept under Cloudflare's
+# ~100s so a slow turn returns cleanly instead of 524). FILE turns need MUCH longer (ChatGPT
+# ingesting a multi-MB doc), and the streaming path keeps Cloudflare alive with keepalives, so
+# they get their own larger budget — capping them at 85s was a regression that broke big docs.
 TURN_HARD_TIMEOUT = float(os.environ.get("TURN_HARD_TIMEOUT", "85"))
+FILE_TURN_HARD_TIMEOUT = float(os.environ.get("FILE_TURN_HARD_TIMEOUT", "300"))
 
 WATCHDOG_INTERVAL = float(os.environ.get("WATCHDOG_INTERVAL", "10"))
 WATCHDOG_SOFT_S = float(os.environ.get("WATCHDOG_SOFT_S", "130"))
@@ -285,9 +289,10 @@ class BrowserSessionService:
             self._stream_answer_via_dom(page, request.holder, baseline=baseline)
         else:
             assert isinstance(request.holder, dict)
+            cap = FILE_TURN_HARD_TIMEOUT if request.files else TURN_HARD_TIMEOUT
             request.holder["answer"] = w.session.ask(
                 request.prompt, request.model_slug, image=request.image, files=request.files,
-                answer_timeout=TURN_HARD_TIMEOUT)
+                answer_timeout=cap)
 
     def _put_error(self, request: "SessionRequest", exc: Exception) -> None:
         if request.stream:
@@ -400,7 +405,8 @@ class BrowserSessionService:
             if request is None:
                 break
 
-            w.in_flight = {"model": request.model_slug or "auto", "started": time.time()}
+            w.in_flight = {"model": request.model_slug or "auto", "started": time.time(),
+                           "budget": FILE_TURN_HARD_TIMEOUT if request.files else TURN_HARD_TIMEOUT}
             try:
                 self._run_turn(w, request)
             except browser.RateLimitedError as exc:
@@ -467,9 +473,15 @@ class BrowserSessionService:
                 if not inf:
                     continue
                 age = now - inf.get("started", now)
-                if age > WATCHDOG_HARD_S:
+                # Each turn declares its own budget (file turns are legitimately long) — only
+                # flag a turn as stuck once it's past ITS budget plus a margin, so a big-doc
+                # ingest isn't killed while a genuine text hang still recovers fast.
+                budget = inf.get("budget", TURN_HARD_TIMEOUT)
+                hard_at = max(WATCHDOG_HARD_S, budget + 60)
+                soft_at = max(WATCHDOG_SOFT_S, budget + 30)
+                if age > hard_at:
                     hard.append(w)
-                elif age > WATCHDOG_SOFT_S:
+                elif age > soft_at:
                     soft.append(w)
             if hard:
                 logger.critical("Watchdog: a turn is hard-hung (>%.0fs) — %s", WATCHDOG_HARD_S,

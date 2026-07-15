@@ -53,6 +53,9 @@ API_KEY = os.environ.get("API_KEY", "")
 # Hard ceiling on request body size (file uploads are base64, so ~135 MB covers the
 # 100 MB cumulative file cap with overhead). Rejected at the edge before buffering.
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(160 * 1024 * 1024)))
+# Emit an SSE keepalive comment this often while a whole-capture (file/image) turn runs, so
+# Cloudflare / the tunnel don't idle-drop the stream during a long document ingest.
+_KEEPALIVE_S = float(os.environ.get("SSE_KEEPALIVE_S", "15"))
 # Admission control: a single browser serves all turns serially, so an unbounded queue
 # lets one caller starve everyone for minutes. Shed load with 503 + Retry-After once the
 # backlog is this deep.
@@ -1179,7 +1182,16 @@ async def _stream_chat_completion(
 
     t0 = time.time()
     try:
-        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image, files)
+        # File/image turns are captured whole (can't token-stream) and a big-doc ingest can take
+        # minutes. Run it in the background and emit SSE keepalive comments so Cloudflare / the
+        # tunnel don't idle-drop the connection while ChatGPT ingests the document.
+        _t = asyncio.ensure_future(asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image, files))
+        while True:
+            done, _pending = await asyncio.wait({_t}, timeout=_KEEPALIVE_S)
+            if done:
+                break
+            yield ": keepalive\n\n"
+        answer = _t.result()
     except Exception as exc:
         METRICS.record(model_req=model, model_res=model_slug, status="error",
                        error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
@@ -1249,7 +1261,13 @@ async def _stream_completion(
 ):
     t0 = time.time()
     try:
-        answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image)
+        _t = asyncio.ensure_future(asyncio.to_thread(SERVICE.ask, prompt, temporary, model_slug, image))
+        while True:
+            done, _pending = await asyncio.wait({_t}, timeout=_KEEPALIVE_S)
+            if done:
+                break
+            yield ": keepalive\n\n"
+        answer = _t.result()
     except Exception as exc:
         METRICS.record(model_req=model, model_res=model_slug, status="error",
                        error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
