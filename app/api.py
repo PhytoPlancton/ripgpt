@@ -880,6 +880,46 @@ def create_app() -> FastAPI:
                                    error_type="invalid_request_error", code="key_not_found")
         return {"id": kid, "force_model": model or None}
 
+    # ── ChatGPT account onboarding (add more accounts from the UI, no .env / redeploy) ──
+    @app.post("/admin/accounts")
+    async def admin_accounts_add(request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        label = str(body.get("label", "")).strip() or "compte"
+        cookie = str(body.get("cookie", "")).strip()
+        if len(cookie) < 20:
+            return _error_response("Colle le cookie ChatGPT complet (en-tête Cookie).",
+                                   status_code=400, error_type="invalid_request_error", code="invalid_cookie")
+        rec = SERVICE.add_account(label, cookie)   # launches the worker live (bootstraps the profile)
+        return {"id": rec["id"], "label": rec["label"]}   # cookie is NOT echoed back / stored
+
+    @app.post("/admin/accounts/{aid}/reconnect")
+    async def admin_accounts_reconnect(aid: str, request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        cookie = str(body.get("cookie", "")).strip()
+        if len(cookie) < 20:
+            return _error_response("Colle un cookie ChatGPT valide.", status_code=400,
+                                   error_type="invalid_request_error", code="invalid_cookie")
+        if not SERVICE.reconnect_account(aid, cookie):
+            return _error_response("Compte introuvable.", status_code=404,
+                                   error_type="invalid_request_error", code="account_not_found")
+        return {"ok": True}
+
+    @app.post("/admin/accounts/{aid}/remove")
+    async def admin_accounts_remove(aid: str, request: Request):
+        _require_admin(request)
+        _check_csrf(request)
+        return {"removed": SERVICE.remove_account(aid)}
+
     # ── model enable/disable ───────────────────────────────────────────────────
     @app.get("/admin/models")
     async def admin_models_list(request: Request):
