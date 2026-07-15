@@ -69,6 +69,8 @@ class Worker:
         self.ready = threading.Event()
         self.stop = threading.Event()       # set → worker exits and removes itself
         self.pending_cookie: str | None = None  # set → worker re-bootstraps with this cookie
+        self.restart_req = threading.Event()    # set → THIS worker restarts its browser
+        self.restart_done = threading.Event()   # signals the requested restart completed
         self.thread: threading.Thread | None = None
 
 
@@ -162,10 +164,22 @@ class BrowserSessionService:
         return ok
 
     def reconnect_account(self, account_id: str, cookie: str) -> bool:
-        """Re-bootstrap an account's worker with a fresh cookie (done in the worker thread)."""
+        """Re-bootstrap an account's worker with a fresh cookie.
+
+        If the worker thread is alive it re-bootstraps in its own loop (pending_cookie).
+        If it died at startup (e.g. the first cookie was invalid) we RESPAWN the thread —
+        otherwise a fresh cookie would be silently dropped and the account stay dead.
+        """
         for w in list(self._workers):
             if w.account_id == account_id:
-                w.pending_cookie = cookie or ""
+                w.cookies = cookie or ""
+                if w.thread and w.thread.is_alive():
+                    w.pending_cookie = cookie or ""
+                else:
+                    w.startup_error = None
+                    w.ready.clear()
+                    w.stop.clear()
+                    self._spawn(w)
                 return True
         return False
 
@@ -179,25 +193,17 @@ class BrowserSessionService:
     def set_paused(self, value: bool) -> None:
         self._paused = bool(value)
 
-    def _safe_enqueue_restart(self) -> None:
-        try:
-            self._request_queue.put(SessionRequest(prompt="", temporary=False, holder={},
-                                                   done_event=threading.Event(), control="restart"))
-        except Exception:
-            pass
-
     def request_restart(self, timeout: float = 120) -> bool:
+        """Restart every worker's browser — each targeted on its OWN Worker (no shared-queue race)."""
         self._ensure_ready()
-        events = []
-        for _ in list(self._workers):
-            ev = threading.Event()
-            self._request_queue.put(SessionRequest(prompt="", temporary=False, holder={},
-                                                   done_event=ev, control="restart"))
-            events.append(ev)
+        ws = list(self._workers)
+        for w in ws:
+            w.restart_done.clear()
+            w.restart_req.set()
         deadline = time.time() + timeout
         ok = True
-        for ev in events:
-            ok = ev.wait(max(0.0, deadline - time.time())) and ok
+        for w in ws:
+            ok = w.restart_done.wait(max(0.0, deadline - time.time())) and ok
         return ok
 
     def _worker_state(self, w: Worker) -> str:
@@ -294,8 +300,10 @@ class BrowserSessionService:
 
     def stop(self) -> None:
         workers = list(self._workers)
+        for w in workers:
+            w.stop.set()                     # each worker exits on its next wake (targeted)
         for _ in workers:
-            self._request_queue.put(None)
+            self._request_queue.put(None)    # wake any blocked get() so shutdown is prompt
         for w in workers:
             if w.thread:
                 w.thread.join(timeout=30)
@@ -374,6 +382,11 @@ class BrowserSessionService:
                 logger.info("Reconnecting worker %d with a fresh cookie.", w.id)
                 self._do_restart(w)
                 last_check = time.time()
+            if w.restart_req.is_set():          # targeted restart (admin button / watchdog)
+                w.restart_req.clear()
+                self._do_restart(w)
+                w.restart_done.set()
+                last_check = time.time()
 
             wait = min(_LOOP_WAKE_S, max(0.1, SESSION_CHECK_INTERVAL - (time.time() - last_check)))
             try:
@@ -386,12 +399,6 @@ class BrowserSessionService:
 
             if request is None:
                 break
-
-            if request.control == "restart":
-                self._do_restart(w)
-                request.done_event.set()
-                last_check = time.time()
-                continue
 
             w.in_flight = {"model": request.model_slug or "auto", "started": time.time()}
             try:
@@ -454,28 +461,29 @@ class BrowserSessionService:
         while True:
             time.sleep(WATCHDOG_INTERVAL)
             now = time.time()
-            stuck_hard = False
-            stuck_soft = False
+            hard, soft = [], []
             for w in list(self._workers):
                 inf = w.in_flight
                 if not inf:
                     continue
                 age = now - inf.get("started", now)
                 if age > WATCHDOG_HARD_S:
-                    stuck_hard = True
+                    hard.append(w)
                 elif age > WATCHDOG_SOFT_S:
-                    stuck_soft = True
-            if stuck_hard:
+                    soft.append(w)
+            if hard:
                 logger.critical("Watchdog: a turn is hard-hung (>%.0fs) — %s", WATCHDOG_HARD_S,
-                                "exiting for container restart" if WATCHDOG_HARD_EXIT else "enqueuing restart")
+                                "exiting for container restart" if WATCHDOG_HARD_EXIT else "restarting worker")
                 if WATCHDOG_HARD_EXIT:
                     os._exit(1)
-                self._safe_enqueue_restart()
-            elif stuck_soft:
+                for w in hard:
+                    w.restart_req.set()   # targeted at the actually-stuck worker
+            elif soft:
                 if not self._degraded:
                     self._degraded = True
                     logger.warning("Watchdog: a turn is stuck (>%.0fs) — degraded.", WATCHDOG_SOFT_S)
-                    self._safe_enqueue_restart()
+                    for w in soft:
+                        w.restart_req.set()
             else:
                 self._degraded = False
 
