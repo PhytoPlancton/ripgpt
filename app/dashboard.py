@@ -377,7 +377,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   </section>
 
   <!-- ── Comptes (multi-account onboarding) ── -->
-  <section id="tab-account" class="tab">
+  <section id="tab-accounts" class="tab">
     <div class="card">
       <h3>Comptes ChatGPT connectés</h3>
       <p class="muted" style="font-size:12px;margin:-4px 0 10px">Chaque compte = un navigateur dédié. Les requêtes se répartissent automatiquement dessus.</p>
