@@ -168,6 +168,24 @@ class KeyStore:
             if now - self._last_persist >= _PERSIST_MIN_INTERVAL:
                 self._save_locked()
 
+    # ── per-key forced model ─────────────────────────────────────────────────
+    def forced_model(self, rid: str | None) -> str | None:
+        """The model this key is pinned to (overrides the client's requested model), or None."""
+        if not rid:
+            return None
+        with self._lock:
+            rec = self._by_id.get(rid)
+            return (rec or {}).get("force_model") or None
+
+    def set_forced_model(self, rid: str, model: str | None) -> bool:
+        with self._lock:
+            rec = self._by_id.get(rid)
+            if not rec:
+                return False
+            rec["force_model"] = (model or "").strip() or None
+            self._save_locked()
+            return True
+
     # ── model enable/disable ─────────────────────────────────────────────────
     def disabled_models(self) -> set[str]:
         with self._lock:
@@ -195,6 +213,7 @@ class KeyStore:
             "created": rec.get("created"),
             "last_used": rec.get("last_used"),
             "revoked": bool(rec.get("revoked")),
+            "force_model": rec.get("force_model") or None,
         }
 
 

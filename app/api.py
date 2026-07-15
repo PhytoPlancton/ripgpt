@@ -568,9 +568,13 @@ def create_app() -> FastAPI:
                             log.info("[payload]   text len=%d head=%r tail=%r", len(t), t[:220], t[-120:])
                         elif isinstance(it, dict):
                             log.info("[payload]   part=%s keys=%s", it.get("type"), list(it.keys()))
-        resolved_model = _resolve_model(payload.model)
-        if resolved_model is None or not KEYS.is_model_enabled(resolved_model):
-            return _error_response(f"The model '{payload.model}' does not exist.", status_code=404, error_type="invalid_request_error", code="model_not_found")
+        forced = KEYS.forced_model(key_id)
+        if forced and forced in MODELS:
+            resolved_model = forced   # this key is pinned to a model — ignore what the client asked
+        else:
+            resolved_model = _resolve_model(payload.model)
+            if resolved_model is None or not KEYS.is_model_enabled(resolved_model):
+                return _error_response(f"The model '{payload.model}' does not exist.", status_code=404, error_type="invalid_request_error", code="model_not_found")
         if payload.n != 1:
             return _error_response("Only n=1 is supported.")
 
@@ -651,9 +655,13 @@ def create_app() -> FastAPI:
     @app.post("/completions")
     async def completions(payload: CompletionRequest, request: Request):
         key_id = _authorize_request(request)
-        resolved_model = _resolve_model(payload.model)
-        if resolved_model is None or not KEYS.is_model_enabled(resolved_model):
-            return _error_response(f"The model '{payload.model}' does not exist.", status_code=404, error_type="invalid_request_error", code="model_not_found")
+        forced = KEYS.forced_model(key_id)
+        if forced and forced in MODELS:
+            resolved_model = forced   # this key is pinned to a model — ignore what the client asked
+        else:
+            resolved_model = _resolve_model(payload.model)
+            if resolved_model is None or not KEYS.is_model_enabled(resolved_model):
+                return _error_response(f"The model '{payload.model}' does not exist.", status_code=404, error_type="invalid_request_error", code="model_not_found")
         if payload.n != 1:
             return _error_response("Only n=1 is supported.")
 
@@ -853,6 +861,24 @@ def create_app() -> FastAPI:
         _require_admin(request)
         _check_csrf(request)
         return {"revoked": KEYS.revoke(kid)}
+
+    @app.post("/admin/keys/{kid}/model")
+    async def admin_keys_model(kid: str, request: Request):
+        # Pin this key to a model (overrides whatever the client requests), or "" to clear.
+        _require_admin(request)
+        _check_csrf(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        model = str(body.get("model", "")).strip()
+        if model and model not in MODELS:
+            return _error_response(f"Unknown model '{model}'.", status_code=404,
+                                   error_type="invalid_request_error", code="model_not_found")
+        if not KEYS.set_forced_model(kid, model or None):
+            return _error_response("Unknown key.", status_code=404,
+                                   error_type="invalid_request_error", code="key_not_found")
+        return {"id": kid, "force_model": model or None}
 
     # ── model enable/disable ───────────────────────────────────────────────────
     @app.get("/admin/models")

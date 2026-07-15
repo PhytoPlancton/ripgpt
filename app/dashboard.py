@@ -286,7 +286,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <!-- ── Prompts (conversation log) ── -->
   <section id="tab-logs" class="tab">
     <div class="card">
-      <h3>Prompts envoyés à ChatGPT <span class="act"><button id="refreshLogs">⟳ refresh</button> <button class="warn" id="clearLogs">vider</button></span></h3>
+      <h3>Prompts envoyés à ChatGPT <span class="act"><select id="logsFilter" onchange="renderLogs()"><option value="">tous les sites</option></select> <button id="refreshLogs">⟳ refresh</button> <button class="warn" id="clearLogs">vider</button></span></h3>
       <p class="muted" style="font-size:12px;margin:-4px 0 10px">Le prompt exact (historique aplati) envoyé pour chaque requête + la réponse. En mémoire (perdu au redémarrage), max 200.</p>
       <div id="logsList"><div class="muted">chargement…</div></div>
     </div>
@@ -305,8 +305,8 @@ DASHBOARD_HTML = r"""<!doctype html>
         <div class="val" id="secretVal" title="cliquer pour copier"></div>
       </div>
       <div class="tbl-wrap"><table>
-        <thead><tr><th>nom</th><th>préfixe</th><th>requêtes</th><th>~coût API</th><th>utilisée</th><th></th></tr></thead>
-        <tbody id="keysBody"><tr><td colspan="6" class="muted">chargement…</td></tr></tbody>
+        <thead><tr><th>nom</th><th>préfixe</th><th>modèle forcé</th><th>requêtes</th><th>~coût API</th><th>utilisée</th><th></th></tr></thead>
+        <tbody id="keysBody"><tr><td colspan="7" class="muted">chargement…</td></tr></tbody>
       </table></div>
     </div>
   </section>
@@ -381,7 +381,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 let reqChart, latChart, costChart;
-let LAST_STATS = {}, KEYS_CACHE = [], SETTINGS_BOUNDS = null, SETTINGS_LOADED = false;
+let LAST_STATS = {}, KEYS_CACHE = [], MODELS_CACHE = [], LOGS_CACHE = [], SETTINGS_BOUNDS = null, SETTINGS_LOADED = false;
 
 function csrfToken(){ const m=document.cookie.match(/(?:^|; )ripgpt_csrf=([^;]+)/); return m?decodeURIComponent(m[1]):''; }
 async function api(path, opts={}){
@@ -451,7 +451,7 @@ function render(s){
   // charts + lists
   drawReq(s.series||[]);
   drawUsage(s); drawCost(s.by_model_usage||[]); drawLat(s.by_model_latency||[]); drawRecent(s.recent||[]);
-  renderKeysUsage();
+  // keys table is NOT rebuilt here (it holds the forced-model <select>) — refreshed on tab open.
   renderSession(st, s);
   updateSettingsLive(rate);
 }
@@ -525,16 +525,23 @@ function chartOpts(){return{responsive:true,maintainAspectRatio:false,animation:
 async function loadKeys(){ try{ const j=await (await api('/admin/keys')).json(); KEYS_CACHE=j.keys||[]; renderKeysUsage(); }catch(e){} }
 function renderKeysUsage(){
   const usage={}; (LAST_STATS.by_key_usage||[]).forEach(k=>usage[k.key_id]=k);
-  if(!KEYS_CACHE.length){ $('keysBody').innerHTML='<tr><td colspan=6 class=muted>aucune clé — créez-en une</td></tr>'; return; }
+  if(!KEYS_CACHE.length){ $('keysBody').innerHTML='<tr><td colspan=7 class=muted>aucune clé — créez-en une</td></tr>'; return; }
   $('keysBody').innerHTML=KEYS_CACHE.map(k=>{
     const u=usage[k.id]||{requests:0,last_ts:null,cost:0}, rev=k.revoked;
     const nm=esc(k.name)+(rev?' <span class="tag" style="color:var(--red);border-color:#3b1c28">révoquée</span>':'');
     const act=rev?'':`<button class="warn" onclick="revokeKey('${esc(k.id)}')">révoquer</button>`;
+    const opts=['<option value="">— client choisit —</option>'].concat(
+      MODELS_CACHE.map(m=>`<option value="${esc(m)}" ${k.force_model===m?'selected':''}>${esc(m)}</option>`)).join('');
+    const modelCell=rev?'<span class=muted>—</span>':`<select onchange="setKeyModel('${esc(k.id)}',this.value)">${opts}</select>`;
     return `<tr style="${rev?'opacity:.5':''}"><td>${nm}</td><td class=muted>${esc(k.prefix)}…</td>
+      <td>${modelCell}</td>
       <td>${u.requests||0}</td><td style="color:var(--green)">~${fmtMoney(u.cost)}</td>
       <td class=muted>${u.last_ts?rel(u.last_ts):(k.last_used?rel(k.last_used):'jamais')}</td>
       <td style="text-align:right">${act}</td></tr>`;
   }).join('');
+}
+async function setKeyModel(id, model){
+  try{ await api('/admin/keys/'+encodeURIComponent(id)+'/model',{method:'POST',body:JSON.stringify({model})}); await loadKeys(); }catch(e){}
 }
 async function createKey(){
   const name=$('keyName').value.trim()||'key'; const btn=$('createKeyBtn'); btn.disabled=true;
@@ -550,9 +557,11 @@ async function revokeKey(id){ if(!confirm('Révoquer cette clé ? Les clients qu
 /* ── Models ── */
 async function loadModels(){
   try{ const j=await (await api('/admin/models')).json(); const ms=j.models||[];
+    MODELS_CACHE=ms.map(m=>m.id);
     $('modelsBox').innerHTML=ms.map(m=>`<div class="modelrow"><span class="mid">${esc(m.id)}${m.image?' <span class="muted">🖼</span>':''}${m.temporary?'':' <span class="muted">·persist</span>'}</span>
       <div class="sw ${m.enabled?'on':''}" onclick="toggleModel('${esc(m.id)}',${!m.enabled})"><i></i></div></div>`).join('');
     $('testModel').innerHTML=ms.filter(m=>m.enabled).map(m=>`<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('');
+    if(KEYS_CACHE.length) renderKeysUsage();   // re-render keys now that model options are known
   }catch(e){}
 }
 async function toggleModel(id,enabled){ try{ await api('/admin/models/toggle',{method:'POST',body:JSON.stringify({model:id,enabled})}); await loadModels(); }catch(e){} }
@@ -633,7 +642,22 @@ async function doPause(){ const b=$('pauseBtn'), msg=$('sessionMsg'); b.disabled
 }
 
 /* ── Prompts (conversation log) ── */
-function renderLogs(list){
+function keyLabel(id){
+  if(!id) return '—';
+  if(id==='console') return 'console admin';
+  const k=KEYS_CACHE.find(x=>x.id===id);
+  return k?k.name:id;
+}
+function populateLogsFilter(){
+  const sel=$('logsFilter'); if(!sel) return;
+  const cur=sel.value;
+  const ids=[...new Set(LOGS_CACHE.map(c=>c.key_id).filter(Boolean))];
+  sel.innerHTML='<option value="">tous les sites</option>'+
+    ids.map(id=>`<option value="${esc(id)}" ${cur===id?'selected':''}>${esc(keyLabel(id))}</option>`).join('');
+}
+function renderLogs(){
+  const filt=$('logsFilter')?$('logsFilter').value:'';
+  const list=LOGS_CACHE.filter(c=>!filt||c.key_id===filt);
   if(!list.length){ $('logsList').innerHTML='<div class="muted">aucune requête enregistrée pour l\'instant</div>'; return; }
   $('logsList').innerHTML = list.map(c=>{
     const st = c.status==='ok'
@@ -642,7 +666,7 @@ function renderLogs(list){
     const model=esc(c.model_res||c.model_req||'?');
     const preview=esc((c.prompt||'').slice(0,90).replace(/\s+/g,' '));
     return `<details class="logitem">
-      <summary>${st} <b>${model}</b> · ${rel(c.ts)} · ${c.ptoks||0}p/${c.ctoks||0}c${c.key_id?(' · '+esc(c.key_id)):''} <span class="muted">— ${preview}…</span></summary>
+      <summary>${st} <b style="color:var(--cyan)">${esc(keyLabel(c.key_id))}</b> · ${model} · ${rel(c.ts)} · ${c.ptoks||0}p/${c.ctoks||0}c <span class="muted">— ${preview}…</span></summary>
       <div class="loglabel">PROMPT ENVOYÉ${c.prompt_truncated?' (tronqué)':''}</div>
       <pre class="logpre">${esc(c.prompt||'(vide)')}</pre>
       <div class="loglabel">RÉPONSE${c.answer_truncated?' (tronquée)':''}</div>
@@ -651,7 +675,7 @@ function renderLogs(list){
   }).join('');
 }
 async function loadLogs(){
-  try{ const j=await (await api('/admin/logs?limit=100')).json(); renderLogs(j.conversations||[]); }
+  try{ const j=await (await api('/admin/logs?limit=100')).json(); LOGS_CACHE=j.conversations||[]; populateLogsFilter(); renderLogs(); }
   catch(e){ $('logsList').innerHTML='<div class="muted">erreur de chargement</div>'; }
 }
 async function clearLogs(){ if(!confirm('Vider le journal des prompts ?')) return;
