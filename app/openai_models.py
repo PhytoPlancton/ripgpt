@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import re
 import urllib.parse
 from typing import Any, Literal
@@ -141,21 +142,26 @@ PROMPT_TO_FILE_THRESHOLD = 8000
 def prompt_to_attachment_if_large(prompt: str, threshold: int = PROMPT_TO_FILE_THRESHOLD):
     """Return (typed_prompt, [(filename, mime, bytes)]).
 
-    If the prompt embeds a large <context>…</context> block, move that document text to a
-    .md attachment and reduce the typed prompt to the user's trailing query. Otherwise the
-    prompt is returned unchanged with no files."""
-    if not prompt or len(prompt) < threshold:
+    We NO LONGER lift big injected-document context into a .md file upload: driving ChatGPT's
+    web file-upload wedges the browser (its UI/flow changed), so uploading a doc hangs the whole
+    worker. Instead the document text stays INLINE in the prompt (already capped by
+    serialize_messages) and is typed as text — like a normal prompt, which works reliably.
+    We only strip OpenWebUI's <context>/<source> wrapper tags so the model sees clean text.
+    Set ENABLE_DOC_UPLOAD=true to restore the old upload behaviour if the flow is ever fixed."""
+    if os.environ.get("ENABLE_DOC_UPLOAD", "false").strip().lower() in ("1", "true", "yes", "on"):
+        if prompt and len(prompt) >= threshold:
+            m = _CONTEXT_RE.search(prompt)
+            if m:
+                doc = re.sub(r"</?source[^>]*>", "", m.group(1)).strip()
+                if len(doc) >= 500:
+                    query = prompt[m.end():].strip() or "Utilise le(s) document(s) joint(s) pour répondre."
+                    return query, [("document.md", "text/markdown", doc.encode("utf-8"))]
         return prompt, []
-    m = _CONTEXT_RE.search(prompt)
-    if not m:
-        return prompt, []
-    doc = re.sub(r"</?source[^>]*>", "", m.group(1)).strip()   # keep source text, drop tags
-    if len(doc) < 500:
-        return prompt, []
-    query = prompt[m.end():].strip()                            # the real question follows </context>
-    if not query:
-        query = "Utilise le(s) document(s) joint(s) pour répondre."
-    return query, [("document.md", "text/markdown", doc.encode("utf-8"))]
+    # Default: keep everything as text, just remove the wrapper tags.
+    if prompt:
+        prompt = prompt.replace("<context>", "").replace("</context>", "")
+        prompt = re.sub(r"</?source[^>]*>", "", prompt)
+    return prompt, []
 
 
 def last_user_attachment_kind(messages: list[ChatMessage]) -> str | None:
