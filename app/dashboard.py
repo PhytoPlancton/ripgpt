@@ -244,7 +244,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button data-tab="settings">Réglages</button>
     <button data-tab="security">Sécurité</button>
     <button data-tab="session">Session</button>
-    <button data-tab="accounts">Comptes</button>
+    <button data-tab="accounts">Compte</button>
   </nav>
 
   <div id="banner"></div>
@@ -376,21 +376,19 @@ DASHBOARD_HTML = r"""<!doctype html>
     </div>
   </section>
 
-  <!-- ── Comptes (multi-account onboarding) ── -->
+  <!-- ── Compte (single account, changeable) ── -->
   <section id="tab-accounts" class="tab">
     <div class="card">
-      <h3>Comptes ChatGPT connectés</h3>
-      <p class="muted" style="font-size:12px;margin:-4px 0 10px">Chaque compte = un navigateur dédié. Les requêtes se répartissent automatiquement dessus.</p>
+      <h3>Compte ChatGPT</h3>
       <div id="accountsList"><div class="muted">chargement…</div></div>
     </div>
     <div class="card">
-      <h3>Connecter un nouveau compte</h3>
-      <p class="muted" style="font-size:12px;margin:-4px 0 10px">Connecte-toi à chatgpt.com avec l'autre compte → DevTools → Network → une requête chatgpt.com → Headers → copie tout le <code>Cookie:</code> et colle-le ici. Le cookie sert juste à démarrer la session (rien n'est stocké en clair).</p>
-      <div class="fld"><label>nom du compte</label><input id="acctLabel" placeholder="ex: compte 2"/></div>
+      <h3>Changer de compte</h3>
+      <p class="muted" style="font-size:12px;margin:-4px 0 10px">Connecte-toi à chatgpt.com avec le compte voulu → DevTools → Network → une requête chatgpt.com → Headers → copie tout le <code>Cookie:</code> et colle-le ici. Le cookie sert juste à (re)démarrer la session, rien n'est stocké en clair.</p>
       <div class="fld" style="max-width:none"><label>cookie ChatGPT</label><textarea id="acctCookie" rows="3" style="width:100%" placeholder="__Secure-next-auth.session-token=...; ..."></textarea></div>
-      <button class="go" id="addAcctBtn">Connecter le compte</button>
+      <button class="go" id="addAcctBtn">Changer de compte</button>
       <span class="formmsg" id="acctMsg"></span>
-      <p class="muted" style="font-size:12px;margin-top:12px">⚠ Même IP = risque de ban en grappe. Garde les plafonds bas (Réglages) et n'ajoute des comptes que si nécessaire.</p>
+      <p class="muted" style="font-size:12px;margin-top:12px">Le navigateur redémarre sur le nouveau compte (~15s). Surveille l'état ci-dessus.</p>
     </div>
   </section>
 
@@ -661,38 +659,26 @@ async function doPause(){ const b=$('pauseBtn'), msg=$('sessionMsg'); b.disabled
   }catch(e){} b.disabled=false;
 }
 
-/* ── Comptes (multi-account onboarding) ── */
+/* ── Compte ChatGPT (single account, changeable) ── */
 function renderAccounts(workers){
-  if(!workers||!workers.length){ $('accountsList').innerHTML='<div class="muted">aucun compte</div>'; return; }
-  const badge=s=>{
-    const m={logged_in:['var(--green)','connecté'],logged_out:['var(--red)','déconnecté'],
-             starting:['var(--amber)','démarrage…'],browser_dead:['var(--red)','erreur']}[s]||['var(--muted)',s];
-    return `<span class="tag" style="color:${m[0]};border-color:var(--line)">${m[1]}</span>`;
-  };
-  $('accountsList').innerHTML=workers.map(w=>{
-    const meta=`${w.browser_uptime_s!=null?('up '+w.browser_uptime_s+'s'):''}${w.restart_count?(' · '+w.restart_count+' restarts'):''}`;
-    const act = w.account_id
-      ? `<button onclick="reconnectAccount('${esc(w.account_id)}')">reconnecter</button> <button class="warn" onclick="removeAccount('${esc(w.account_id)}')">retirer</button>`
-      : '<span class="muted" style="font-size:11px">via .env</span>';
-    return `<div class="modelrow"><span class="mid">${esc(w.label||('worker '+w.id))} ${badge(w.state)}</span>
-      <span class="muted" style="font-size:11px;margin-right:10px">${meta}</span>${act}</div>`;
-  }).join('');
+  const w=(workers&&workers[0])||null;
+  if(!w){ $('accountsList').innerHTML='<div class="muted">démarrage…</div>'; return; }
+  const m={logged_in:['var(--green)','connecté'],logged_out:['var(--red)','déconnecté — change le cookie ci-dessous'],
+           starting:['var(--amber)','démarrage…'],browser_dead:['var(--red)','erreur — change le cookie ci-dessous']}[w.state]||['var(--muted)',w.state];
+  const meta=`${w.browser_uptime_s!=null?('actif depuis '+w.browser_uptime_s+'s'):''}${w.restart_count?(' · '+w.restart_count+' redémarrages'):''}`;
+  $('accountsList').innerHTML=`<div class="modelrow"><span class="mid">État <span class="tag" style="color:${m[0]};border-color:var(--line)">${m[1]}</span></span>
+    <span class="muted" style="font-size:11px">${meta}</span></div>`;
 }
-async function addAccount(){
-  const label=$('acctLabel').value.trim(), cookie=$('acctCookie').value.trim(), msg=$('acctMsg');
+async function changeAccount(){
+  const cookie=$('acctCookie').value.trim(), msg=$('acctMsg');
   msg.style.color=''; msg.textContent='';
   if(cookie.length<20){ msg.style.color='var(--red)'; msg.textContent='Colle le cookie ChatGPT complet.'; return; }
-  const btn=$('addAcctBtn'); btn.disabled=true; msg.style.color='var(--muted)'; msg.textContent='connexion… (démarrage du navigateur, ~15s)';
-  try{ const r=await api('/admin/accounts',{method:'POST',body:JSON.stringify({label,cookie})});
-    if(r.ok){ $('acctCookie').value=''; $('acctLabel').value=''; msg.style.color='var(--green)'; msg.textContent='✓ compte ajouté — surveille son état ci-dessus (démarrage en cours)'; }
+  const btn=$('addAcctBtn'); btn.disabled=true; msg.style.color='var(--muted)'; msg.textContent='changement… (redémarrage du navigateur, ~15s)';
+  try{ const r=await api('/admin/account',{method:'POST',body:JSON.stringify({cookie})});
+    if(r.ok){ $('acctCookie').value=''; msg.style.color='var(--green)'; msg.textContent='✓ compte changé — surveille l\'état ci-dessus'; }
     else{ const j=await r.json().catch(()=>({})); msg.style.color='var(--red)'; msg.textContent=(j.error&&j.error.message)||('Erreur '+r.status); }
   }catch(e){ msg.style.color='var(--red)'; msg.textContent='Network error'; } btn.disabled=false;
 }
-async function removeAccount(id){ if(!confirm('Retirer ce compte du pool ?')) return;
-  try{ await api('/admin/accounts/'+encodeURIComponent(id)+'/remove',{method:'POST'}); }catch(e){} }
-async function reconnectAccount(id){
-  const cookie=prompt('Colle un cookie ChatGPT frais pour reconnecter ce compte :'); if(!cookie) return;
-  try{ await api('/admin/accounts/'+encodeURIComponent(id)+'/reconnect',{method:'POST',body:JSON.stringify({cookie:cookie.trim()})}); }catch(e){} }
 
 /* ── Prompts (conversation log) ── */
 function keyLabel(id){
@@ -736,7 +722,7 @@ async function clearLogs(){ if(!confirm('Vider le journal des prompts ?')) retur
 
 /* ── wiring ── */
 $('refreshLogs').onclick=loadLogs; $('clearLogs').onclick=clearLogs;
-$('addAcctBtn').onclick=addAccount;
+$('addAcctBtn').onclick=changeAccount;
 $('createKeyBtn').onclick=createKey; $('keyName').addEventListener('keydown',e=>{if(e.key==='Enter')createKey();});
 $('testBtn').onclick=runTest; $('testPrompt').addEventListener('keydown',e=>{if(e.key==='Enter')runTest();});
 $('saveSettingsBtn').onclick=saveSettings;

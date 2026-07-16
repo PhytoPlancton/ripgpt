@@ -10,7 +10,6 @@ from dataclasses import dataclass
 
 from . import browser
 from . import ratelimit
-from . import accounts
 
 
 logger = logging.getLogger("ripgpt.session")
@@ -35,24 +34,16 @@ WATCHDOG_HARD_EXIT = (os.environ.get("WATCHDOG_HARD_EXIT", "true").strip().lower
 FRESH_TEMPORARY_CHAT = (os.environ.get("FRESH_TEMPORARY_CHAT", "true").strip().lower()
                         in ("1", "true", "yes", "on"))
 
-# Extra ChatGPT accounts from env (slot 0 = the main account). UI-added accounts stack on top.
-POOL_SIZE = max(1, min(8, int(os.environ.get("POOL_SIZE", "1") or "1")))
-POOL_STARTUP_STAGGER_S = float(os.environ.get("POOL_STARTUP_STAGGER_S", "5"))
+# Single ChatGPT account (the browser). Multi-account pool was removed for simplicity; the
+# account is changeable from the UI (paste a fresh cookie → re-bootstrap this one browser).
 # How often the worker loop wakes to notice stop/reconnect flags (health check still runs on
 # SESSION_CHECK_INTERVAL). Kept short so UI actions apply within a few seconds.
 _LOOP_WAKE_S = float(os.environ.get("LOOP_WAKE_S", "8"))
 
 
-def _env_worker_config(i: int) -> tuple[str, str, str]:
-    """(profile_dir, session_token, cookies) for env pool slot i. Slot 0 = the main account."""
-    if i == 0:
-        return (browser.BROWSER_PROFILE_DIR, browser.CHATGPT_SESSION_TOKEN, browser.CHATGPT_COOKIES)
-    base = browser.BROWSER_PROFILE_DIR or "/data/profile"
-    return (
-        os.path.join(base, f"slot{i}"),
-        os.environ.get(f"CHATGPT_SESSION_TOKEN_{i}", "").strip(),
-        os.environ.get(f"CHATGPT_COOKIES_{i}", "").strip(),
-    )
+def _main_worker_config() -> tuple[str, str, str]:
+    """(profile_dir, session_token, cookies) for the single ChatGPT account."""
+    return (browser.BROWSER_PROFILE_DIR, browser.CHATGPT_SESSION_TOKEN, browser.CHATGPT_COOKIES)
 
 
 class Worker:
@@ -108,17 +99,8 @@ class BrowserSessionService:
         return Worker(self._next_wid, profile_dir, session_token, cookies, account_id, label)
 
     def _build_initial_workers(self) -> list[Worker]:
-        workers = []
-        for i in range(POOL_SIZE):
-            pd, tok, ck = _env_worker_config(i)
-            workers.append(self._new_worker(pd, tok, ck, None,
-                                            "compte principal" if i == 0 else f"env slot {i}"))
-        base = browser.BROWSER_PROFILE_DIR or "/data/profile"
-        for a in accounts.ACCOUNTS.list():
-            pd = os.path.join(base, f"acct-{a['id']}")
-            # No cookie: rely on the persisted profile (bootstrapped when the account was added).
-            workers.append(self._new_worker(pd, "", "", a["id"], a.get("label") or a["id"]))
-        return workers
+        pd, tok, ck = _main_worker_config()
+        return [self._new_worker(pd, tok, ck, None, "compte ChatGPT")]
 
     def _spawn(self, w: Worker) -> None:
         w.thread = threading.Thread(target=self._worker_loop, args=(w,),
@@ -148,44 +130,26 @@ class BrowserSessionService:
     def health_ok(self) -> bool:
         return self.is_ready() and not self._degraded
 
-    # ── account onboarding (from the UI) ────────────────────────────────────────
-    def add_account(self, label: str, cookie: str) -> dict:
-        """Register a new ChatGPT account, launch its worker live (bootstraps from the cookie)."""
-        rec = accounts.ACCOUNTS.add(label)
-        base = browser.BROWSER_PROFILE_DIR or "/data/profile"
-        pd = os.path.join(base, f"acct-{rec['id']}")
-        w = self._new_worker(pd, "", cookie or "", rec["id"], rec["label"])
-        with self._workers_lock:
-            self._workers.append(w)
-        self._spawn(w)
-        return rec
+    # ── change the ChatGPT account from the UI ──────────────────────────────────
+    def set_account_cookie(self, cookie: str) -> bool:
+        """Re-bootstrap the single browser with a fresh ChatGPT cookie (change account).
 
-    def remove_account(self, account_id: str) -> bool:
-        ok = accounts.ACCOUNTS.remove(account_id)
-        for w in list(self._workers):
-            if w.account_id == account_id:
-                w.stop.set()
-        return ok
-
-    def reconnect_account(self, account_id: str, cookie: str) -> bool:
-        """Re-bootstrap an account's worker with a fresh cookie.
-
-        If the worker thread is alive it re-bootstraps in its own loop (pending_cookie).
-        If it died at startup (e.g. the first cookie was invalid) we RESPAWN the thread —
-        otherwise a fresh cookie would be silently dropped and the account stay dead.
-        """
-        for w in list(self._workers):
-            if w.account_id == account_id:
-                w.cookies = cookie or ""
-                if w.thread and w.thread.is_alive():
-                    w.pending_cookie = cookie or ""
-                else:
-                    w.startup_error = None
-                    w.ready.clear()
-                    w.stop.clear()
-                    self._spawn(w)
-                return True
-        return False
+        A live worker re-bootstraps inside its own loop (pending_cookie). If it died at
+        startup (bad/expired cookie), respawn the thread with the new cookie so a fresh
+        cookie is never silently dropped."""
+        workers = list(self._workers)
+        if not workers:
+            return False
+        w = workers[0]
+        w.cookies = cookie or ""
+        if w.thread and w.thread.is_alive():
+            w.pending_cookie = cookie or ""
+        else:
+            w.startup_error = None
+            w.ready.clear()
+            w.stop.clear()
+            self._spawn(w)
+        return True
 
     # ── monitoring / control ──────────────────────────────────────────────
     def queue_depth(self) -> int:
@@ -357,8 +321,6 @@ class BrowserSessionService:
             logger.error("Session health check/restore failed (worker %d): %s", w.id, exc)
 
     def _worker_loop(self, w: Worker) -> None:
-        if w.id and POOL_STARTUP_STAGGER_S:
-            time.sleep(min(w.id, 4) * POOL_STARTUP_STAGGER_S)   # avoid simultaneous logins (same IP)
         logger.info("Starting browser session (worker %d: %s)...", w.id, w.label)
         try:
             w.session = browser.ChatSession(profile_dir=w.profile_dir,
