@@ -723,9 +723,12 @@ def create_app() -> FastAPI:
 
     @app.get("/health")
     async def health():
-        ok = SERVICE.health_ok()
-        body = {"status": "ok" if ok else "degraded", "session_ready": SERVICE.is_ready()}
-        return JSONResponse(body, status_code=200 if ok else 503)
+        # ALWAYS 200 if the API process is alive. The Docker healthcheck must NOT flap just
+        # because the ChatGPT session is (re)connecting, expired, or degraded — otherwise a
+        # dead session marks the whole container unhealthy and it can't even come up so you
+        # could fix it. Session state is reported in the body for monitoring/the dashboard.
+        return {"status": "ok" if SERVICE.health_ok() else "degraded",
+                "session_ready": SERVICE.is_ready()}
 
     @app.get("/vendor/chart.js")
     async def vendor_chartjs():
