@@ -939,6 +939,20 @@ class ChatSession:
         self._session_token = CHATGPT_SESSION_TOKEN if session_token is None else session_token
         self._cookies = CHATGPT_COOKIES if cookies is None else cookies
         self._playwright = sync_playwright().start()
+        # A failure AFTER start() must not leak a RUNNING Playwright loop in this thread —
+        # otherwise the next ChatSession() built in the same worker thread raises "using
+        # Playwright Sync API inside the asyncio loop". Tear the half-built session down on
+        # any error so the thread is left with a clean asyncio state.
+        try:
+            self._bootstrap_browser()
+        except Exception:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            raise
+
+    def _bootstrap_browser(self) -> None:
         self._persistent = bool(self._profile_dir)
         if self._persistent:
             # Persistent context: cookies/storage live in the profile dir (a volume),

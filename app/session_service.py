@@ -225,23 +225,26 @@ class BrowserSessionService:
             "workers": workers,
         }
 
-    def _do_restart(self, w: Worker) -> None:
-        logger.info("Restarting browser session (worker %d)...", w.id)
+    def _respawn_worker(self, w: Worker) -> None:
+        """Tear down the browser and start a fresh one IN A NEW THREAD.
+
+        Playwright's sync API cannot be re-started in a thread that already ran one — the
+        second sync_playwright().start() raises "using Playwright Sync API inside the asyncio
+        loop". So every browser lifecycle gets its own thread: close the current session, then
+        spawn a fresh worker thread that builds a brand-new ChatSession from a clean asyncio
+        state. The CALLING worker thread MUST return immediately after this — the fresh thread
+        takes over the request queue."""
+        logger.info("Recreating browser session in a fresh thread (worker %d)...", w.id)
         try:
             if w.session is not None:
                 w.session.close()
         except Exception:
             pass
-        try:
-            w.session = browser.ChatSession(profile_dir=w.profile_dir,
-                                            session_token=w.session_token, cookies=w.cookies)
-            w.browser_start_ts = time.time()
-            w.restart_count += 1
-            w.startup_error = None
-            logger.info("Browser session restarted (worker %d).", w.id)
-        except Exception as exc:
-            w.startup_error = exc
-            logger.exception("Browser restart failed (worker %d).", w.id)
+        w.session = None
+        w.ready.clear()
+        w.startup_error = None
+        w.restart_count += 1
+        self._spawn(w)   # fresh thread → fresh sync_playwright().start()
 
     def _run_turn(self, w: Worker, request: "SessionRequest", force_fresh: bool = False) -> None:
         self._start_new_chat(w, temporary=request.temporary, force=force_fresh)
@@ -326,15 +329,17 @@ class BrowserSessionService:
             w.session = browser.ChatSession(profile_dir=w.profile_dir,
                                             session_token=w.session_token, cookies=w.cookies)
             w.browser_start_ts = time.time()
+            w.startup_error = None
         except Exception as exc:
             w.startup_error = exc
             logger.exception("Browser startup failed (worker %d).", w.id)
             w.ready.set()
-            # A UI-added account whose bootstrap failed: leave it (shows browser_dead) so the
-            # admin can reconnect; env slot 0 failing is the classic single-account error.
+            w.restart_done.set()   # unblock any restart/reconnect waiter (this boot failed)
+            # Leave the worker in browser_dead so the admin can reconnect a fresh cookie.
             return
 
         w.ready.set()
+        w.restart_done.set()       # a fresh browser is up → unblock any restart waiter
         logger.info("Browser session ready (worker %d: %s).", w.id, w.label)
         last_check = time.time()
 
@@ -346,14 +351,13 @@ class BrowserSessionService:
             if w.pending_cookie is not None:
                 w.cookies = w.pending_cookie
                 w.pending_cookie = None
-                logger.info("Reconnecting worker %d with a fresh cookie.", w.id)
-                self._do_restart(w)
-                last_check = time.time()
+                logger.info("Reconnecting worker %d with a fresh cookie (fresh thread).", w.id)
+                self._respawn_worker(w)
+                return   # fresh thread takes over the queue (sets restart_done when ready)
             if w.restart_req.is_set():          # targeted restart (admin button / watchdog)
                 w.restart_req.clear()
-                self._do_restart(w)
-                w.restart_done.set()
-                last_check = time.time()
+                self._respawn_worker(w)
+                return   # fresh thread takes over the queue (sets restart_done when ready)
 
             wait = min(_LOOP_WAKE_S, max(0.1, SESSION_CHECK_INTERVAL - (time.time() - last_check)))
             try:
@@ -398,13 +402,10 @@ class BrowserSessionService:
                         self._put_error(request, exc2)
                         logger.error("Retry after nav race failed (worker %d): %s", w.id, exc2)
                 elif wedged:
-                    logger.warning("Session wedged (worker %d) — recreating + retry.", w.id)
-                    self._do_restart(w)
-                    try:
-                        self._run_turn(w, request)
-                    except Exception as exc2:
-                        self._put_error(request, exc2)
-                        logger.error("Retry after restart failed (worker %d): %s", w.id, exc2)
+                    logger.warning("Session wedged (worker %d) — recreating in a fresh thread.", w.id)
+                    self._put_error(request, exc)   # clean error to the client; fresh browser serves the next call
+                    self._respawn_worker(w)
+                    return   # the finally sets done_event; fresh thread takes over
                 else:
                     self._put_error(request, exc)
                     logger.error("Session error (worker %d): %s", w.id, exc)
