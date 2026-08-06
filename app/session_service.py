@@ -51,6 +51,11 @@ SESSION_RECYCLE_S = float(os.environ.get("SESSION_RECYCLE_S", "1200"))
 # (during a recycle/respawn/re-auth) before giving up with a retryable SessionUnavailable
 # (→ HTTP 503 + Retry-After). Kept well under Cloudflare's ~100s edge timeout.
 READY_WAIT_S = float(os.environ.get("READY_WAIT_S", "75"))
+# Self-heal: after this many consecutive turn failures on an otherwise-"ready" session, recycle
+# it (fresh thread). A session can be logged-in yet silently broken (turns fail fast) — without
+# this, /health keeps reporting session_ready:true while every turn 503s until the periodic
+# recycle. Recycling makes session_ready honest again and recovers serving within a few failures.
+CONSECUTIVE_ERROR_RECYCLE = int(os.environ.get("CONSECUTIVE_ERROR_RECYCLE", "3"))
 
 
 class SessionUnavailable(RuntimeError):
@@ -81,6 +86,7 @@ class Worker:
         self.in_flight: dict | None = None
         self.browser_start_ts: float | None = None
         self.turns_since_recycle = 0        # served turns since this browser started (→ recycle)
+        self.consecutive_errors = 0         # consecutive failed turns (→ self-heal recycle)
         self.restart_count = 0
         self.startup_error: Exception | None = None
         self.ready = threading.Event()
@@ -372,6 +378,7 @@ class BrowserSessionService:
         w.ready.set()
         w.restart_done.set()       # a fresh browser is up → unblock any restart waiter
         w.turns_since_recycle = 0
+        w.consecutive_errors = 0
         logger.info("Browser session ready (worker %d: %s).", w.id, w.label)
         last_check = time.time()
 
@@ -414,6 +421,7 @@ class BrowserSessionService:
 
             w.in_flight = {"model": request.model_slug or "auto", "started": time.time(),
                            "budget": FILE_TURN_HARD_TIMEOUT if request.files else TURN_HARD_TIMEOUT}
+            failed = False   # counts toward self-heal (rate-limit + wedge are handled separately)
             try:
                 self._run_turn(w, request)
             except browser.RateLimitedError as exc:
@@ -422,13 +430,14 @@ class BrowserSessionService:
                     ratelimit.RATE.trip_cooldown()
                 except Exception:
                     pass
-                self._put_error(request, exc)
+                self._put_error(request, exc)   # backend-busy, NOT a broken session → don't count
             except browser.StaleChatError:
                 logger.warning("Temporary chat expired (worker %d) — fresh chat + retry.", w.id)
                 try:
                     self._run_turn(w, request, force_fresh=True)
                 except Exception as exc2:
                     self._put_error(request, exc2)
+                    failed = True
                     logger.error("Retry on fresh chat failed (worker %d): %s", w.id, exc2)
             except Exception as exc:
                 msg = str(exc)
@@ -441,6 +450,7 @@ class BrowserSessionService:
                         self._run_turn(w, request)
                     except Exception as exc2:
                         self._put_error(request, exc2)
+                        failed = True
                         logger.error("Retry after nav race failed (worker %d): %s", w.id, exc2)
                 elif wedged:
                     logger.warning("Session wedged (worker %d) — recreating in a fresh thread.", w.id)
@@ -449,12 +459,22 @@ class BrowserSessionService:
                     return   # the finally sets done_event; fresh thread takes over
                 else:
                     self._put_error(request, exc)
+                    failed = True
                     logger.error("Session error (worker %d): %s", w.id, exc)
             finally:
                 w.in_flight = None
                 w.turns_since_recycle += 1
                 request.done_event.set()
                 last_check = time.time()
+
+            # Self-heal: a run of failures on a "ready" session means it's silently broken →
+            # recycle (fresh thread) so session_ready stops lying and turns recover fast.
+            w.consecutive_errors = w.consecutive_errors + 1 if failed else 0
+            if w.consecutive_errors >= CONSECUTIVE_ERROR_RECYCLE:
+                logger.warning("Worker %d: %d consecutive turn failures — recycling (fresh thread).",
+                               w.id, w.consecutive_errors)
+                self._respawn_worker(w)
+                return
 
         logger.info("Shutting down browser session (worker %d)...", w.id)
         if w.session is not None:

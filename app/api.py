@@ -80,6 +80,19 @@ def _unavailable_response(retry_after: int = 8):
     )
 
 
+def _upstream_error_response(exc, retry_after: int = 5):
+    # A browser/session turn failure is effectively TRANSIENT for this backend (a flaky tab, a
+    # navigation glitch, a session mid-recycle). Answer 503 + Retry-After so the client retries
+    # the SAME request rather than treating a 500 as permanent and dropping the lead. The full
+    # exception + an opaque ref stay in the server logs (via _safe_upstream_error).
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"message": _safe_upstream_error(exc), "type": "server_error",
+                           "code": "upstream_unavailable"}},
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 def _queue_overloaded() -> bool:
     try:
         return SERVICE.queue_depth() >= SETTINGS.get("max_queue_depth")
@@ -663,7 +676,7 @@ def create_app() -> FastAPI:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
                            key_id=key_id, prompt=prompt)
-            return _error_response(_safe_upstream_error(exc), status_code=500, error_type="server_error")
+            return _upstream_error_response(exc)
 
         latency_ms = int((time.time() - t0) * 1000)
         answer, n_img = _externalize_images(answer, _base_url(request))
@@ -735,7 +748,7 @@ def create_app() -> FastAPI:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
                            key_id=key_id, prompt=prompt)
-            return _error_response(_safe_upstream_error(exc), status_code=500, error_type="server_error")
+            return _upstream_error_response(exc)
 
         latency_ms = int((time.time() - t0) * 1000)
         answer, n_img = _externalize_images(answer, _base_url(request))
