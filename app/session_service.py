@@ -40,6 +40,27 @@ FRESH_TEMPORARY_CHAT = (os.environ.get("FRESH_TEMPORARY_CHAT", "true").strip().l
 # SESSION_CHECK_INTERVAL). Kept short so UI actions apply within a few seconds.
 _LOOP_WAKE_S = float(os.environ.get("LOOP_WAKE_S", "8"))
 
+# Proactive session recycling: refresh the browser BETWEEN turns before a long-lived session
+# degrades — the classic cause of 502s under sustained sequential load (a ChatGPT tab used
+# non-stop for 20+ min eventually wedges). Recycle after this many served turns OR this many
+# seconds of browser uptime, whichever first. The recycle happens while idle (between turns)
+# and uses the fresh-thread respawn, so an in-flight turn is never interrupted.
+SESSION_RECYCLE_TURNS = int(os.environ.get("SESSION_RECYCLE_TURNS", "40"))
+SESSION_RECYCLE_S = float(os.environ.get("SESSION_RECYCLE_S", "1200"))
+# How long ask()/stream() will HOLD a request waiting for the session to (re)become ready
+# (during a recycle/respawn/re-auth) before giving up with a retryable SessionUnavailable
+# (→ HTTP 503 + Retry-After). Kept well under Cloudflare's ~100s edge timeout.
+READY_WAIT_S = float(os.environ.get("READY_WAIT_S", "75"))
+
+
+class SessionUnavailable(RuntimeError):
+    """The browser session is temporarily not ready (starting, recycling, or re-authenticating).
+
+    Callers MUST surface this as HTTP 503 + Retry-After so a client backs off and retries the
+    same lead later — never a 500 (which makes the client give up) and never a Cloudflare HTML
+    page. A permanently-dead session (expired cookie) also raises this: the client keeps the
+    lead queued and it flows the moment the cookie is refreshed (visible on /health)."""
+
 
 def _main_worker_config() -> tuple[str, str, str]:
     """(profile_dir, session_token, cookies) for the single ChatGPT account."""
@@ -59,6 +80,7 @@ class Worker:
         self.session: browser.ChatSession | None = None
         self.in_flight: dict | None = None
         self.browser_start_ts: float | None = None
+        self.turns_since_recycle = 0        # served turns since this browser started (→ recycle)
         self.restart_count = 0
         self.startup_error: Exception | None = None
         self.ready = threading.Event()
@@ -162,12 +184,19 @@ class BrowserSessionService:
         self._paused = bool(value)
 
     def request_restart(self, timeout: float = 120) -> bool:
-        """Restart every worker's browser — each targeted on its OWN Worker (no shared-queue race)."""
-        self._ensure_ready()
+        """Restart every worker's browser. Works even when a worker died at startup
+        (browser_dead): a dead worker is respawned directly (its loop isn't running to consume
+        restart_req), a live one is signalled to recycle itself in a fresh thread. No readiness
+        gate — the whole point is to recover an unhealthy session."""
         ws = list(self._workers)
         for w in ws:
             w.restart_done.clear()
-            w.restart_req.set()
+            if w.thread and w.thread.is_alive():
+                w.restart_req.set()          # live loop → respawns in a fresh thread
+            else:
+                w.startup_error = None
+                w.ready.clear()
+                self._spawn(w)               # dead → respawn directly (fresh thread)
         deadline = time.time() + timeout
         ok = True
         for w in ws:
@@ -307,11 +336,13 @@ class BrowserSessionService:
         return chunk_queue
 
     def _ensure_ready(self) -> None:
-        if not self.wait_until_ready():
+        # HOLD the caller up to READY_WAIT_S so a recycle/respawn/re-auth window is transparent
+        # (the request waits, then is served). If still not ready, raise a RETRYABLE
+        # SessionUnavailable → the API answers 503 + Retry-After (never 500 / HTML).
+        if not self.wait_until_ready(READY_WAIT_S):
             snap = list(self._workers)
-            if snap and all(w.startup_error is not None for w in snap):
-                raise RuntimeError(f"Browser session failed to start: {snap[0].startup_error}")
-            raise TimeoutError("Browser session did not become ready in time.")
+            detail = "re-authenticating" if (snap and snap[0].startup_error is not None) else "starting"
+            raise SessionUnavailable(f"Browser session not ready ({detail}).")
 
     def _check_and_restore_session(self, w: Worker) -> None:
         if w.session is None:
@@ -340,6 +371,7 @@ class BrowserSessionService:
 
         w.ready.set()
         w.restart_done.set()       # a fresh browser is up → unblock any restart waiter
+        w.turns_since_recycle = 0
         logger.info("Browser session ready (worker %d: %s).", w.id, w.label)
         last_check = time.time()
 
@@ -358,6 +390,15 @@ class BrowserSessionService:
                 w.restart_req.clear()
                 self._respawn_worker(w)
                 return   # fresh thread takes over the queue (sets restart_done when ready)
+            # Proactive recycle BETWEEN turns (idle here) before the session degrades → far
+            # fewer wedges/502s under sustained load. Fresh thread; queued turns wait briefly.
+            uptime = time.time() - w.browser_start_ts if w.browser_start_ts else 0.0
+            if (w.turns_since_recycle >= SESSION_RECYCLE_TURNS
+                    or (SESSION_RECYCLE_S and uptime >= SESSION_RECYCLE_S)):
+                logger.info("Proactive recycle (worker %d): %d turns, %.0fs uptime — fresh thread.",
+                            w.id, w.turns_since_recycle, uptime)
+                self._respawn_worker(w)
+                return   # fresh thread takes over the queue
 
             wait = min(_LOOP_WAKE_S, max(0.1, SESSION_CHECK_INTERVAL - (time.time() - last_check)))
             try:
@@ -411,6 +452,7 @@ class BrowserSessionService:
                     logger.error("Session error (worker %d): %s", w.id, exc)
             finally:
                 w.in_flight = None
+                w.turns_since_recycle += 1
                 request.done_event.set()
                 last_check = time.time()
 

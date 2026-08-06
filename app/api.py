@@ -43,7 +43,7 @@ from app.openai_models import (
     prompt_to_attachment_if_large,
     serialize_messages,
 )
-from app.session_service import BrowserSessionService
+from app.session_service import BrowserSessionService, SessionUnavailable, READY_WAIT_S
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -65,6 +65,18 @@ def _overloaded_response():
         content={"error": {"message": "Server busy — too many requests queued. Retry shortly.",
                            "type": "server_error", "code": "overloaded"}},
         headers={"Retry-After": "10"},
+    )
+
+
+def _unavailable_response(retry_after: int = 8):
+    # The browser session is (re)starting, recycling, or re-authenticating. Return a RETRYABLE
+    # JSON 503 + Retry-After (never a 500 / Cloudflare HTML) so the client waits and re-sends the
+    # same request instead of burning its retry budget or dropping the lead.
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"message": "Browser session warming up or re-authenticating. Retry shortly.",
+                           "type": "server_error", "code": "session_unavailable"}},
+        headers={"Retry-After": str(retry_after)},
     )
 
 
@@ -616,6 +628,10 @@ def create_app() -> FastAPI:
             return _rate_limited_response(_rl_wait, _rl_reason)
 
         if payload.stream:
+            # Gate readiness BEFORE the stream starts: once StreamingResponse sends its 200 we
+            # can't switch to a 503. Off-loop wait so we never block the event loop.
+            if not await asyncio.to_thread(SERVICE.wait_until_ready, READY_WAIT_S):
+                return _unavailable_response()
             return StreamingResponse(
                 _stream_chat_completion(
                     prompt=prompt,
@@ -638,6 +654,11 @@ def create_app() -> FastAPI:
         t0 = time.time()
         try:
             answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug, image=image, files=files)
+        except SessionUnavailable:
+            METRICS.record(model_req=resolved_model, model_res=slug, status="error",
+                           error_class="unavailable", latency_ms=int((time.time() - t0) * 1000),
+                           key_id=key_id, prompt=prompt)
+            return _unavailable_response()
         except Exception as exc:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
@@ -705,6 +726,11 @@ def create_app() -> FastAPI:
         t0 = time.time()
         try:
             answer = SERVICE.ask(prompt, temporary=temporary, model_slug=slug, image=image)
+        except SessionUnavailable:
+            METRICS.record(model_req=resolved_model, model_res=slug, status="error",
+                           error_class="unavailable", latency_ms=int((time.time() - t0) * 1000),
+                           key_id=key_id, prompt=prompt)
+            return _unavailable_response()
         except Exception as exc:
             METRICS.record(model_req=resolved_model, model_res=slug, status="error",
                            error_class=classify_error(str(exc)), latency_ms=int((time.time() - t0) * 1000),
@@ -1022,6 +1048,10 @@ def create_app() -> FastAPI:
         t0 = time.time()
         try:
             answer = await asyncio.to_thread(SERVICE.ask, prompt, temporary, slug, image, None)
+        except SessionUnavailable:
+            METRICS.record(model_req=resolved, model_res=slug, status="error", error_class="unavailable",
+                           latency_ms=int((time.time() - t0) * 1000), key_id="console", prompt=prompt)
+            return _unavailable_response()
         except Exception as exc:
             METRICS.record(model_req=resolved, model_res=slug, status="error",
                            error_class=classify_error(str(exc)),
