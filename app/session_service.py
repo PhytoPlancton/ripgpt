@@ -152,7 +152,12 @@ class BrowserSessionService:
         return self.is_ready()
 
     def is_ready(self) -> bool:
+        # A logged-out session (cookie expired — only ever set when auth WAS configured) is NOT
+        # ready: it can't serve the account's models, and attempting turns just fails and churns.
+        # Reporting it not-ready → session_ready:false + clients get 503 → they wait for a fresh
+        # cookie instead of the browser being recycled hundreds of times (ban risk).
         return any(w.ready.is_set() and w.startup_error is None and w.session is not None
+                   and not getattr(w.session, "logged_out", False)
                    for w in list(self._workers))
 
     def health_ok(self) -> bool:
@@ -399,9 +404,12 @@ class BrowserSessionService:
                 return   # fresh thread takes over the queue (sets restart_done when ready)
             # Proactive recycle BETWEEN turns (idle here) before the session degrades → far
             # fewer wedges/502s under sustained load. Fresh thread; queued turns wait briefly.
+            # Never recycle a logged-out session (pointless re-boot loop → ban risk) — wait for a
+            # fresh cookie instead.
             uptime = time.time() - w.browser_start_ts if w.browser_start_ts else 0.0
-            if (w.turns_since_recycle >= SESSION_RECYCLE_TURNS
-                    or (SESSION_RECYCLE_S and uptime >= SESSION_RECYCLE_S)):
+            if (not (w.session and getattr(w.session, "logged_out", False))
+                    and (w.turns_since_recycle >= SESSION_RECYCLE_TURNS
+                         or (SESSION_RECYCLE_S and uptime >= SESSION_RECYCLE_S))):
                 logger.info("Proactive recycle (worker %d): %d turns, %.0fs uptime — fresh thread.",
                             w.id, w.turns_since_recycle, uptime)
                 self._respawn_worker(w)
@@ -468,9 +476,18 @@ class BrowserSessionService:
                 last_check = time.time()
 
             # Self-heal: a run of failures on a "ready" session means it's silently broken →
-            # recycle (fresh thread) so session_ready stops lying and turns recover fast.
+            # recycle (fresh thread) so session_ready stops lying and turns recover fast. BUT
+            # NOT if the session is logged out: recycling can't re-login without a fresh cookie,
+            # it would just re-boot the browser on a loop (hammering chatgpt.com = ban risk). A
+            # logged-out session is left as-is (is_ready() already reports it not-ready) until
+            # the admin pastes a fresh cookie.
+            logged_out = bool(w.session and getattr(w.session, "logged_out", False))
             w.consecutive_errors = w.consecutive_errors + 1 if failed else 0
-            if w.consecutive_errors >= CONSECUTIVE_ERROR_RECYCLE:
+            if logged_out:
+                if w.consecutive_errors:
+                    logger.warning("Worker %d logged out (cookie expired) — NOT recycling; "
+                                   "waiting for a fresh cookie.", w.id)
+            elif w.consecutive_errors >= CONSECUTIVE_ERROR_RECYCLE:
                 logger.warning("Worker %d: %d consecutive turn failures — recycling (fresh thread).",
                                w.id, w.consecutive_errors)
                 self._respawn_worker(w)
